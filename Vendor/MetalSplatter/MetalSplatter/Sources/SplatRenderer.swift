@@ -152,6 +152,22 @@ public final class SplatRenderer: @unchecked Sendable {
     /// `.pi` disables re-sorting while moving.
     public var stochasticResortAngle: Float = 45 * .pi / 180
 
+    /// LOCAL PATCH (see VENDORED.md): in `.movement`, blend each stochastic frame with the previous
+    /// output reprojected by this frame's depth (temporal accumulation after SteadySplats). The
+    /// last exact (sorted) frame seeds the history when the camera starts moving. The coverage
+    /// pattern stays fixed while the camera moves (changing it every frame measured as more flicker)
+    /// and changes every frame while the camera is still and the sort has not landed yet, so the
+    /// image converges toward the sorted one before the switch. Needs a single viewport, a 2D
+    /// single-sample color target and a depth texture with `.shaderRead` usage; seeding also needs
+    /// `.shaderRead` on the color target (e.g. `MTKView.framebufferOnly = false`) and the `.store`
+    /// action. Otherwise renders fall back to the plain stochastic image.
+    public var stochasticTemporalAccumulation: Bool = true
+
+    /// LOCAL PATCH (see VENDORED.md): weight of the reprojected history in the temporal accumulation
+    /// while the camera moves (SteadySplats' delta-bar). While it is still (waiting for the sort), the
+    /// weight grows to n / (n + 1) after n still frames, a running mean of the changing patterns.
+    public var stochasticHistoryWeight: Float = 0.7
+
     /// LOCAL PATCH (see VENDORED.md): whether the most recent successful render used stochastic
     /// transparency.
     public private(set) var lastRenderWasStochastic = false
@@ -255,6 +271,18 @@ public final class SplatRenderer: @unchecked Sendable {
         var composeReverseZDepthState: MTLDepthStencilState?
         /// Offscreen coverage target for the quad resolve; reallocated when the size changes.
         var stochasticTarget: MTLTexture?
+        // LOCAL PATCH (see VENDORED.md): temporal accumulation
+        var stochasticTemporalPipelineState: MTLRenderPipelineState?
+        var stochasticHistorySeedPipelineState: MTLRenderPipelineState?
+        /// Ping-pong history; `stochasticHistory[stochasticHistoryIndex]` holds the latest output.
+        var stochasticHistory: [MTLTexture] = []
+        var stochasticHistoryIndex = 0
+        /// View-projection the latest history was rendered with; nil when there is no usable history.
+        var stochasticHistoryViewProjection: simd_float4x4?
+        /// Consecutive still frames accumulated into the history.
+        var stochasticStillFrames = 0
+        /// Advances the coverage pattern of temporally accumulated still frames.
+        var stochasticFrameIndex: UInt32 = 0
         /// Camera pose of the previous render, to tell whether the camera is still.
         var previousCameraPose: SplatSorter.CameraPose?
         /// The last pose passed to the sorter.
@@ -555,6 +583,8 @@ public final class SplatRenderer: @unchecked Sendable {
         renderState.stochasticDepthState = nil
         renderState.stochasticReverseZDepthState = nil
         renderState.stochasticResolvePipelineState = nil
+        renderState.stochasticTemporalPipelineState = nil
+        renderState.stochasticHistorySeedPipelineState = nil
     }
 
     private func buildSingleStagePipelineStatesIfNeeded() throws {
@@ -747,20 +777,117 @@ public final class SplatRenderer: @unchecked Sendable {
 
     /// The offscreen coverage target for the quad resolve, matching `colorTexture`'s size.
     private func stochasticTarget(matching colorTexture: MTLTexture) -> MTLTexture? {
-        if let target = renderState.stochasticTarget,
-           target.width == colorTexture.width, target.height == colorTexture.height {
-            return target
+        let target = offscreenTarget(renderState.stochasticTarget, matching: colorTexture,
+                                     pixelFormat: colorFormat, label: "Stochastic Coverage")
+        renderState.stochasticTarget = target
+        return target
+    }
+
+    /// `existing` if it matches `colorTexture`'s size, otherwise a new private render target.
+    private func offscreenTarget(_ existing: MTLTexture?, matching colorTexture: MTLTexture,
+                                 pixelFormat: MTLPixelFormat, label: String) -> MTLTexture? {
+        if let existing, existing.width == colorTexture.width, existing.height == colorTexture.height {
+            return existing
         }
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: colorFormat,
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat,
                                                                   width: colorTexture.width,
                                                                   height: colorTexture.height,
                                                                   mipmapped: false)
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .private
         let target = device.makeTexture(descriptor: descriptor)
-        target?.label = "Stochastic Coverage"
-        renderState.stochasticTarget = target
+        target?.label = label
         return target
+    }
+
+    // MARK: - Stochastic Temporal Accumulation (LOCAL PATCH, see VENDORED.md)
+
+    /// 10 bits per channel: an 8-bit history would stall the moving average short of small changes.
+    private static let stochasticHistoryFormat: MTLPixelFormat = .rgb10a2Unorm
+
+    // Keep in sync with StochasticRenderPath.metal : StochasticTemporalParams
+    private struct StochasticTemporalParams {
+        var reprojection: simd_float4x4
+        var viewportOrigin: SIMD2<Float>
+        var viewportSize: SIMD2<Float>
+        var historyWeight: Float
+        var reverseZ: UInt32
+        var quadResolve: UInt32
+    }
+
+    private func buildStochasticTemporalPipelineStatesIfNeeded() throws {
+        guard renderState.stochasticTemporalPipelineState == nil else { return }
+
+        let temporal = MTLRenderPipelineDescriptor()
+        temporal.label = "StochasticTemporalPipeline"
+        temporal.vertexFunction = library.makeRequiredFunction(name: "stochasticResolveVertexShader")
+        temporal.fragmentFunction = library.makeRequiredFunction(name: "stochasticTemporalFragmentShader")
+        temporal.colorAttachments[0].pixelFormat = colorFormat
+        temporal.colorAttachments[1].pixelFormat = Self.stochasticHistoryFormat
+        renderState.stochasticTemporalPipelineState = try device.makeRenderPipelineState(descriptor: temporal)
+
+        let seed = MTLRenderPipelineDescriptor()
+        seed.label = "StochasticHistorySeedPipeline"
+        seed.vertexFunction = library.makeRequiredFunction(name: "stochasticResolveVertexShader")
+        seed.fragmentFunction = library.makeRequiredFunction(name: "stochasticHistorySeedFragmentShader")
+        seed.colorAttachments[0].pixelFormat = Self.stochasticHistoryFormat
+        renderState.stochasticHistorySeedPipelineState = try device.makeRenderPipelineState(descriptor: seed)
+    }
+
+    /// The two history textures, matching `colorTexture`'s size. Reallocating drops the history.
+    private func stochasticHistoryTextures(matching colorTexture: MTLTexture) -> [MTLTexture]? {
+        let current = renderState.stochasticHistory
+        let history = (0..<2).compactMap { i in
+            offscreenTarget(current.count == 2 ? current[i] : nil, matching: colorTexture,
+                            pixelFormat: Self.stochasticHistoryFormat, label: "Stochastic History \(i)")
+        }
+        guard history.count == 2 else {
+            renderState.stochasticHistory = []
+            renderState.stochasticHistoryViewProjection = nil
+            return nil
+        }
+        if current.count != 2 || current[0] !== history[0] {
+            renderState.stochasticHistoryViewProjection = nil
+        }
+        renderState.stochasticHistory = history
+        return history
+    }
+
+    /// Maps clip coordinates of a frame rendered with `current` to those of one rendered with
+    /// `previous` (computed in double precision; the inverse of a perspective matrix loses digits).
+    private static func reprojection(from current: simd_float4x4, to previous: simd_float4x4) -> simd_float4x4 {
+        func toDouble(_ m: simd_float4x4) -> simd_double4x4 {
+            simd_double4x4(columns: (SIMD4<Double>(m.columns.0), SIMD4<Double>(m.columns.1),
+                                     SIMD4<Double>(m.columns.2), SIMD4<Double>(m.columns.3)))
+        }
+        let m = toDouble(previous) * toDouble(current).inverse
+        return simd_float4x4(columns: (SIMD4<Float>(m.columns.0), SIMD4<Float>(m.columns.1),
+                                       SIMD4<Float>(m.columns.2), SIMD4<Float>(m.columns.3)))
+    }
+
+    /// Copies an exact frame into the history so the first stochastic frames blend with it.
+    private func seedStochasticHistory(from colorTexture: MTLTexture,
+                                       viewProjection: simd_float4x4,
+                                       to commandBuffer: MTLCommandBuffer) {
+        renderState.stochasticHistoryViewProjection = nil
+        guard (try? buildStochasticTemporalPipelineStatesIfNeeded()) != nil,
+              let pipelineState = renderState.stochasticHistorySeedPipelineState,
+              let history = stochasticHistoryTextures(matching: colorTexture)
+        else { return }
+        let next = 1 - renderState.stochasticHistoryIndex
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = history[next]
+        pass.colorAttachments[0].loadAction = .dontCare
+        pass.colorAttachments[0].storeAction = .store
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+        encoder.label = "Stochastic History Seed"
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setFragmentTexture(colorTexture, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+        renderState.stochasticHistoryIndex = next
+        renderState.stochasticHistoryViewProjection = viewProjection
+        renderState.stochasticStillFrames = 0
     }
 
     /// Whether the projection maps far depths to smaller values (reverse-Z, e.g. visionOS).
@@ -1018,6 +1145,17 @@ public final class SplatRenderer: @unchecked Sendable {
         case .movement: stochastic = obtained.sortedPose != pose
         }
         let isFinal = mode == .stochastic || obtained.sortedPose == pose
+        // LOCAL PATCH (see VENDORED.md): temporal accumulation applies to `.movement` only
+        // (`.stochastic` reports every frame final, so a viewer would stop before it converged).
+        let temporal = mode == .movement
+            && stochasticTemporalAccumulation
+            && viewports.count == 1
+            && renderTargetArrayLength <= 1
+            && rasterizationRateMap == nil
+            && sampleCount == 1
+            && colorTexture.textureType == .type2D
+            && depthTexture?.usage.contains(.shaderRead) == true
+        let viewProjection = viewports[0].projectionMatrix * viewports[0].viewMatrix
 
         commandBuffer.addCompletedHandler { [sorter, weak self] _ in
             self?.renderCompleted()
@@ -1066,6 +1204,8 @@ public final class SplatRenderer: @unchecked Sendable {
                                                 allChunks: allChunks,
                                                 triangleVertexCount: triangleVertexCount,
                                                 instanceCount: instanceCount,
+                                                temporal: temporal,
+                                                cameraIsStill: cameraIsStill,
                                                 to: commandBuffer)
             if rendered {
                 lastRenderWasStochastic = true
@@ -1153,6 +1293,12 @@ public final class SplatRenderer: @unchecked Sendable {
         }
 
         renderEncoder.endEncoding()
+        // LOCAL PATCH (see VENDORED.md): an exact frame seeds the temporal history.
+        if temporal && isFinal && colorStoreAction == .store && colorTexture.usage.contains(.shaderRead) {
+            seedStochasticHistory(from: colorTexture, viewProjection: viewProjection, to: commandBuffer)
+        } else {
+            renderState.stochasticHistoryViewProjection = nil
+        }
         lastRenderWasStochastic = false  // LOCAL PATCH
         lastRenderWasFinal = isFinal  // LOCAL PATCH
         return true
@@ -1195,6 +1341,8 @@ public final class SplatRenderer: @unchecked Sendable {
                                   allChunks: [ChunkEntry],
                                   triangleVertexCount: Int,
                                   instanceCount: Int,
+                                  temporal requested: Bool,
+                                  cameraIsStill: Bool,
                                   to commandBuffer: MTLCommandBuffer) throws -> Bool {
         try buildStochasticPipelineStatesIfNeeded()
         guard let pipelineState = renderState.stochasticPipelineState,
@@ -1207,14 +1355,37 @@ public final class SplatRenderer: @unchecked Sendable {
             && rasterizationRateMap == nil
             && sampleCount == 1
             && colorTexture.textureType == .type2D
-        guard let coverageTexture = resolve ? stochasticTarget(matching: colorTexture) : colorTexture
+        // The caller checked the same conditions as `resolve` plus a readable depth texture.
+        var temporal = requested
+        if temporal {
+            try buildStochasticTemporalPipelineStatesIfNeeded()
+        }
+        let history = temporal ? stochasticHistoryTextures(matching: colorTexture) : nil
+        if history == nil {
+            temporal = false
+        }
+        if !temporal {
+            renderState.stochasticHistoryViewProjection = nil
+        }
+
+        let offscreenCoverage = resolve || temporal
+        guard let coverageTexture = offscreenCoverage ? stochasticTarget(matching: colorTexture) : colorTexture
         else { return false }
         let reverseZ = Self.isReverseZ(viewports[0].projectionMatrix)
+
+        // Still temporal frames advance the coverage pattern along the golden-ratio sequence; moving
+        // frames keep the fixed pattern (offset 0).
+        var thresholdOffset: Float = 0
+        if temporal && cameraIsStill {
+            renderState.stochasticFrameIndex &+= 1
+            thresholdOffset = Float((Double(renderState.stochasticFrameIndex) * 0.6180339887498949)
+                .truncatingRemainder(dividingBy: 1))
+        }
 
         let renderEncoder = renderEncoder(multiStage: false,
                                           viewports: viewports,
                                           colorTexture: coverageTexture,
-                                          colorStoreAction: resolve ? .store : colorStoreAction,
+                                          colorStoreAction: offscreenCoverage ? .store : colorStoreAction,
                                           depthTexture: depthTexture,
                                           clearDepth: reverseZ ? 0.0 : 1.0,
                                           rasterizationRateMap: rasterizationRateMap,
@@ -1227,6 +1398,7 @@ public final class SplatRenderer: @unchecked Sendable {
         renderEncoder.setVertexBuffer(dynamicUniformBuffers, offset: renderState.uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
         renderEncoder.setVertexBuffer(chunksBuffer, offset: 0, index: BufferIndex.chunks.rawValue)
         renderEncoder.setVertexBuffer(splatIndexBuffer, offset: 0, index: BufferIndex.splatIndex.rawValue)
+        renderEncoder.setFragmentBytes(&thresholdOffset, length: MemoryLayout<Float>.size, index: 0)
         for entry in allChunks {
             renderEncoder.useResource(entry.chunk.splats.buffer, usage: .read, stages: .vertex)
             if let shBuffer = entry.chunk.shCoefficients?.buffer {
@@ -1242,12 +1414,35 @@ public final class SplatRenderer: @unchecked Sendable {
         renderEncoder.popDebugGroup()
         renderEncoder.endEncoding()
 
-        guard resolve else { return true }
+        // The temporal pass applies the quad resolve itself.
+        guard temporal, let history else {
+            return !resolve || encodeQuadResolve(from: coverageTexture, to: colorTexture,
+                                                 storeAction: colorStoreAction,
+                                                 pipelineState: resolvePipelineState,
+                                                 commandBuffer: commandBuffer)
+        }
+        return encodeTemporalResolve(current: coverageTexture,
+                                     quadResolve: resolve,
+                                     history: history,
+                                     depthTexture: depthTexture,
+                                     colorTexture: colorTexture,
+                                     colorStoreAction: colorStoreAction,
+                                     viewport: viewports[0],
+                                     reverseZ: reverseZ,
+                                     cameraIsStill: cameraIsStill,
+                                     commandBuffer: commandBuffer)
+    }
 
+    /// LOCAL PATCH (see VENDORED.md): averages the coverage over 2x2 quads into `target`.
+    private func encodeQuadResolve(from coverageTexture: MTLTexture,
+                                   to target: MTLTexture,
+                                   storeAction: MTLStoreAction,
+                                   pipelineState resolvePipelineState: MTLRenderPipelineState,
+                                   commandBuffer: MTLCommandBuffer) -> Bool {
         let resolvePass = MTLRenderPassDescriptor()
-        resolvePass.colorAttachments[0].texture = colorTexture
+        resolvePass.colorAttachments[0].texture = target
         resolvePass.colorAttachments[0].loadAction = .dontCare  // every pixel is overwritten
-        resolvePass.colorAttachments[0].storeAction = colorStoreAction
+        resolvePass.colorAttachments[0].storeAction = storeAction
         guard let resolveEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: resolvePass) else {
             return false
         }
@@ -1256,6 +1451,62 @@ public final class SplatRenderer: @unchecked Sendable {
         resolveEncoder.setFragmentTexture(coverageTexture, index: 0)
         resolveEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         resolveEncoder.endEncoding()
+        return true
+    }
+
+    /// LOCAL PATCH (see VENDORED.md): blends the reprojected history into `current` (quad-resolving
+    /// it first when `quadResolve`), writing the result to `colorTexture` and to the next history
+    /// texture.
+    private func encodeTemporalResolve(current: MTLTexture,
+                                       quadResolve: Bool,
+                                       history: [MTLTexture],
+                                       depthTexture: MTLTexture,
+                                       colorTexture: MTLTexture,
+                                       colorStoreAction: MTLStoreAction,
+                                       viewport: ViewportDescriptor,
+                                       reverseZ: Bool,
+                                       cameraIsStill: Bool,
+                                       commandBuffer: MTLCommandBuffer) -> Bool {
+        guard let pipelineState = renderState.stochasticTemporalPipelineState else { return false }
+        let viewProjection = viewport.projectionMatrix * viewport.viewMatrix
+        var weight: Float = 0
+        var reprojection = matrix_identity_float4x4
+        if let previous = renderState.stochasticHistoryViewProjection {
+            reprojection = Self.reprojection(from: viewProjection, to: previous)
+            renderState.stochasticStillFrames = cameraIsStill ? renderState.stochasticStillFrames + 1 : 0
+            let still = Float(renderState.stochasticStillFrames)
+            weight = max(stochasticHistoryWeight, still / (still + 1))
+        } else {
+            renderState.stochasticStillFrames = 0
+        }
+        var params = StochasticTemporalParams(
+            reprojection: reprojection,
+            viewportOrigin: SIMD2(Float(viewport.viewport.originX), Float(viewport.viewport.originY)),
+            viewportSize: SIMD2(Float(viewport.viewport.width), Float(viewport.viewport.height)),
+            historyWeight: weight,
+            reverseZ: reverseZ ? 1 : 0,
+            quadResolve: quadResolve ? 1 : 0)
+
+        let previous = renderState.stochasticHistoryIndex
+        let next = 1 - previous
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = colorTexture
+        pass.colorAttachments[0].loadAction = .dontCare  // every pixel is overwritten
+        pass.colorAttachments[0].storeAction = colorStoreAction
+        pass.colorAttachments[1].texture = history[next]
+        pass.colorAttachments[1].loadAction = .dontCare
+        pass.colorAttachments[1].storeAction = .store
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        encoder.label = "Stochastic Temporal Resolve"
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setFragmentTexture(current, index: 0)
+        encoder.setFragmentTexture(history[previous], index: 1)
+        encoder.setFragmentTexture(depthTexture, index: 2)
+        encoder.setFragmentBytes(&params, length: MemoryLayout<StochasticTemporalParams>.stride, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+        renderState.stochasticHistoryIndex = next
+        renderState.stochasticHistoryViewProjection = viewProjection
         return true
     }
 

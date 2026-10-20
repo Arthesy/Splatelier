@@ -82,6 +82,10 @@ final class SplatViewerRenderer: NSObject, MTKViewDelegate {
         view.colorPixelFormat = viewerColorFormat
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = 1
+        // The stochastic temporal accumulation reprojects with the depth, and seeds its history from
+        // the exact frame on screen (SplatRenderer.stochasticTemporalAccumulation).
+        view.depthStencilAttachmentTextureUsage = [.renderTarget, .shaderRead]
+        view.framebufferOnly = false
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         // Stay paused until loading finishes (requestRedraw resumes).
         view.isPaused = true

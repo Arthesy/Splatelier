@@ -194,6 +194,7 @@ Main papers:
 | 3D Gaussian Splatting | Kerbl et al. 2023, ACM TOG 42(4) |
 | 3D Gaussian Splatting as MCMC | Kheradmand et al. 2024 |
 | EWA splatting (viewer's 2D covariance) | Zwicker et al. 2001, IEEE Visualization |
+| SteadySplats (viewer's temporal accumulation while moving) | Windisch et al. 2026, arXiv 2610.05576 |
 | PocketGS | arXiv 2601.17354 |
 | ImprovedGS+ | arXiv 2603.08661 |
 | Mobile3DRecon | Yang et al. 2020, ISMAR |

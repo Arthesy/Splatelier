@@ -100,6 +100,35 @@ All are marked `LOCAL PATCH` in the source.
     The 2D covariance matches upstream's to float precision, and against a double-precision
     reference the axis error is smaller than upstream's, most of all in the worst case.
 
+11. Temporal accumulation of the stochastic frames in `.movement`
+    (`SplatRenderer.stochasticTemporalAccumulation`, on by default), after the temporal resampling of
+    SteadySplats (Windisch et al. 2026, arXiv:2610.05576):
+    - `MetalSplatter/Resources/StochasticRenderPath.metal`: `stochasticTemporalFragmentShader`
+      reprojects the previous output with this frame's depth (the nearest of the pixel and its four
+      neighbours), samples it with a 5-tap Catmull-Rom filter and blends it in with weight 0.7. The
+      weight falls as 1/m when the history lies m times outside a YCoCg box of the current 3x3
+      neighbourhood's standard deviation, whose size shrinks from 4 to 1 sigma as the screen-space
+      motion grows to 4 px. Pixels whose history falls off screen show the current frame. The pass
+      applies the 2x2 quad resolve itself and writes both the output and the next history
+      (`rgb10a2Unorm`, two textures in ping-pong). `stochasticHistorySeedFragmentShader` copies an
+      exact sorted frame into the history. The coverage fragment shader takes a threshold offset
+      (a rotation modulo 1, which keeps the quad stratification).
+    - `MetalSplatter/Sources/SplatRenderer.swift`: the passes, the history textures and the
+      reprojection matrix (computed in double precision). The final sorted frame seeds the history,
+      so the first moving frames start from the exact image. The coverage pattern stays fixed while
+      the camera moves and advances only on still frames waiting for the sort, which are then
+      averaged (weight n / (n + 1)), so the image converges toward the sorted one before the switch.
+      The pass needs a depth texture with `.shaderRead` usage and, for seeding, a readable color
+      target; the viewers set `depthStencilAttachmentTextureUsage` and `framebufferOnly = false`.
+
+    Measured on an M-series Mac against sorted blending at the same poses (294k-splat room scan,
+    1180x1280, orbit of 60 frames): PSNR 28.6 → 30.6 dB and frame-to-frame PSNR 30.5 → 32.9 dB at
+    1 degree per frame, with similar gains at 0.25 and 2 degrees and on a 555k and a 1.6M-splat
+    scene. The step at the switch to sorted blending after stopping shrank (PSNR 29.1 → 33.5 dB).
+    Changing the pattern every frame while moving gave a higher PSNR at slow motion but more
+    flicker. GPU energy per frame at 60 fps: no measurable change at 1179x2556, +2 to +13% at
+    1180x1280.
+
 Result of patches 1–4: the blend space follows the render target format. An sRGB target keeps upstream
 behaviour (linear blending). A non-sRGB target such as `.bgra8Unorm` blends sRGB-encoded
 colors, which matches training. Our viewers use `.bgra8Unorm`.

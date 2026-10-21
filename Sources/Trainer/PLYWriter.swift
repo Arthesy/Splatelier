@@ -11,9 +11,6 @@ import MLX
 /// (w, x, y, z) order (so orientation is right even for readers that don't normalize).
 public enum PLYWriter {
 
-    /// Number of higher-order SH coefficients in the model (3, since degree 1).
-    static let modelRestBands = GaussianModel.shRestBands
-
     /// Number of higher-order coefficients written to the PLY. MetalSplatter's reader accepts only
     /// 0 or 45 f_rest, so this is always degree-3's 15 (= 45 f_rest), zero-filled after the model's
     /// coefficients.
@@ -70,113 +67,57 @@ public enum PLYWriter {
         to url: URL,
         cull: CullOptions = CullOptions()
     ) throws -> CullStats {
-        let n = model.count
-        let means = model.means.asArray(Float.self)
-        let sh0 = model.sh0.asArray(Float.self)            // [N*3]
-        let shN = model.shN.asArray(Float.self)            // [N*modelRestBands*3], band-major
-        let logScales = model.logScales.asArray(Float.self)
-        let logitOpac = model.logitOpacities.asArray(Float.self)
-        let quats = model.quats.asArray(Float.self)
-
-        // Keep condition: finite, opacity > minOpacity, max scale < maxScale, coordinates <
-        // maxAbsCoord. The environment sphere is an intentional far shell, so it is exempt from all
-        // culls except NaN (fixed thresholds would wrongly cut it).
-        let fgN = Swift.max(0, n - Swift.max(0, model.environmentCount))
-        var keep = [Bool](repeating: true, count: n)
-        var nNonFinite = 0, nLowOpac = 0, nGiant = 0, nOutlier = 0
-        if cull.enabled {
-            for i in 0..<n {
-                var finite = true
-                for k in 0..<3 where !means[i * 3 + k].isFinite { finite = false; break }
-                if finite { for k in 0..<3 where !sh0[i * 3 + k].isFinite { finite = false; break } }
-                if finite { for k in 0..<3 where !logScales[i * 3 + k].isFinite { finite = false; break } }
-                if finite, !logitOpac[i].isFinite { finite = false }
-                if finite { for k in 0..<4 where !quats[i * 4 + k].isFinite { finite = false; break } }
-                if finite {
-                    for k in 0..<(modelRestBands * 3)
-                    where !shN[i * modelRestBands * 3 + k].isFinite { finite = false; break }
-                }
-                if !finite { keep[i] = false; nNonFinite += 1; continue }
-
-                // The environment sphere is exempt from the remaining culls.
-                if i >= fgN { continue }
-
-                let opac = 1.0 / (1.0 + expf(-logitOpac[i]))
-                if opac <= cull.minOpacity { keep[i] = false; nLowOpac += 1; continue }
-
-                let s0 = expf(logScales[i * 3 + 0])
-                let s1 = expf(logScales[i * 3 + 1])
-                let s2 = expf(logScales[i * 3 + 2])
-                let sMax = Swift.max(s0, Swift.max(s1, s2))
-                if sMax >= cull.maxScale { keep[i] = false; nGiant += 1; continue }
-
-                if abs(means[i * 3 + 0]) >= cull.maxAbsCoord
-                    || abs(means[i * 3 + 1]) >= cull.maxAbsCoord
-                    || abs(means[i * 3 + 2]) >= cull.maxAbsCoord {
-                    keep[i] = false; nOutlier += 1; continue
-                }
-            }
-        }
-
-        let kept = cull.enabled ? keep.reduce(0) { $0 + ($1 ? 1 : 0) } : n
-        let keptEnvironment = cull.enabled ? keep[fgN...].reduce(0) { $0 + ($1 ? 1 : 0) } : n - fgN
-        let stats = CullStats(
-            total: n, kept: kept,
-            droppedNonFinite: nNonFinite,
-            droppedLowOpacity: nLowOpac,
-            droppedGiantScale: nGiant,
-            droppedOutlierPosition: nOutlier,
-            keptEnvironment: keptEnvironment
-        )
         // The breakdown is returned; logging is up to the caller.
+        let (table, stats) = SplatTable.fromModel(model, cull: cull)
+        try write(table, to: url)
+        return stats
+    }
+
+    /// Writes `table` as a standard 3DGS PLY. f_rest is zero-padded to degree 3 whatever the
+    /// table's degree, for MetalSplatter.
+    public static func write(_ table: SplatTable, to url: URL) throws {
+        let n = table.count
+        let tableRest = table.restCoeffs
 
         var header = "ply\n"
         header += "format binary_little_endian 1.0\n"
-        header += "element vertex \(kept)\n"
+        header += "element vertex \(n)\n"
         for p in properties { header += "property float \(p)\n" }
         header += "end_header\n"
 
         var data = Data(header.utf8)
-        data.reserveCapacity(header.utf8.count + kept * properties.count * 4)
+        data.reserveCapacity(header.utf8.count + n * properties.count * 4)
 
         let restOffset = 9
         let opacOffset = restOffset + exportRestBands * 3   // 9 + 45 = 54
         var rec = [Float](repeating: 0, count: properties.count)
-        for i in 0..<n where keep[i] {
-            rec[0] = means[i * 3 + 0]
-            rec[1] = means[i * 3 + 1]
-            rec[2] = means[i * 3 + 2]
+        for i in 0..<n {
+            rec[0] = table.positions[i * 3 + 0]
+            rec[1] = table.positions[i * 3 + 1]
+            rec[2] = table.positions[i * 3 + 2]
             rec[3] = 0; rec[4] = 0; rec[5] = 0  // normals (unused)
-            rec[6] = sh0[i * 3 + 0]
-            rec[7] = sh0[i * 3 + 1]
-            rec[8] = sh0[i * 3 + 2]
-            // f_rest is channel-major. Each channel puts the model's coefficients first, the rest
+            rec[6] = table.sh0[i * 3 + 0]
+            rec[7] = table.sh0[i * 3 + 1]
+            rec[8] = table.sh0[i * 3 + 2]
+            // f_rest is channel-major. Each channel puts the table's coefficients first, the rest
             // 0.
             for ch in 0..<3 {
                 for band in 0..<exportRestBands {
-                    let v: Float = band < modelRestBands
-                        ? shN[i * modelRestBands * 3 + band * 3 + ch]
+                    let v: Float = band < tableRest
+                        ? table.shRest[(i * 3 + ch) * tableRest + band]
                         : 0
                     rec[restOffset + ch * exportRestBands + band] = v
                 }
             }
-            rec[opacOffset] = logitOpac[i]
-            rec[opacOffset + 1] = logScales[i * 3 + 0]
-            rec[opacOffset + 2] = logScales[i * 3 + 1]
-            rec[opacOffset + 3] = logScales[i * 3 + 2]
-            let qw = quats[i * 4 + 0], qx = quats[i * 4 + 1]
-            let qy = quats[i * 4 + 2], qz = quats[i * 4 + 3]
-            let norm = (qw * qw + qx * qx + qy * qy + qz * qz).squareRoot()
-            let inv = norm > 0 ? 1 / norm : 1
-            rec[opacOffset + 4] = qw * inv
-            rec[opacOffset + 5] = qx * inv
-            rec[opacOffset + 6] = qy * inv
-            rec[opacOffset + 7] = qz * inv
+            rec[opacOffset] = table.logitOpacities[i]
+            rec[opacOffset + 1] = table.logScales[i * 3 + 0]
+            rec[opacOffset + 2] = table.logScales[i * 3 + 1]
+            rec[opacOffset + 3] = table.logScales[i * 3 + 2]
+            for k in 0..<4 { rec[opacOffset + 4 + k] = table.quats[i * 4 + k] }
             rec.withUnsafeBytes { data.append(contentsOf: $0) }
         }
 
         try data.write(to: url)
-        return stats
     }
 
     /// Writes `<base>.background.json` next to a PLY: the number of rows at the end of the PLY that

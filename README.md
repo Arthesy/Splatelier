@@ -35,7 +35,8 @@ and compiled to Metal.
 - **Export**: standard 3DGS PLY files that common splat viewers can open, and a mesh (OBJ) generated
   from the trained scene. Files are available in the Files app.
 - **Mac tools**: retrain a capture from the app on a Mac, train and evaluate on COLMAP scenes, and
-  inspect PLY files from the command line.
+  inspect PLY files from the command line. `splatelier convert` turns a PLY into compressed PLY, SPZ,
+  .splat, glTF (GLB) or SOG.
 
 ## Requirements
 
@@ -173,6 +174,9 @@ We referred to the code of these projects while writing our own:
 - [SuperSplat](https://github.com/playcanvas/supersplat) and the
   [PlayCanvas Engine](https://github.com/playcanvas/engine) (MIT): stochastic transparency in the
   viewer
+- [splat-transform](https://github.com/playcanvas/splat-transform) (MIT): the compressed PLY, SOG
+  and glTF (KHR_gaussian_splatting) export layouts, and the codebook quantization and Morton order
+  used by them
 
 Main papers:
 

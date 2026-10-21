@@ -74,6 +74,12 @@ func usage() {
     print("    Drag to orbit, scroll to zoom; close the window to quit.")
     print("    env: VIEWER_TRANSPARENCY=sorted|stochastic|movement (default movement = stochastic alpha only while interacting)")
     print("")
+    print("  splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog}> [shDegree]")
+    print("    Convert a trained PLY to another splat format, picked by the output extension.")
+    print("    Keeps every SH band the PLY has unless [shDegree] (0-3) lowers it. SOG and GLB need")
+    print("    no viewer support here; the <base>.background.json sidecar is read and, for")
+    print("    PLY/SPZ/.splat, written. env: SOG_ITERATIONS=<n> (SH k-means, default 10)")
+    print("")
     print("  splatelier train-view <colmap_scene_dir> [iterations] [maxDim] [maxPoints] [output.ply] [capMax] [init] [replayCache]")
     print("    Train with MCMC densification in a live window that updates as it")
     print("    optimizes. Same training as `train`; pass output.ply to also save the")
@@ -738,6 +744,38 @@ case "stats":
         print("scale:    median \(median(scH))  mean \(mean(scH))  max \(scH.max() ?? 0)")
     } catch {
         print("stats failed: \(error)"); exit(1)
+    }
+
+case "convert":
+    guard args.count >= 4 else {
+        print("usage: splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog}> [shDegree]")
+        exit(1)
+    }
+    let inURL = URL(fileURLWithPath: args[2])
+    let outURL = URL(fileURLWithPath: args[3])
+    guard let format = SplatExportFormat(url: outURL) else {
+        print("convert: unknown output extension \(outURL.lastPathComponent)"); exit(1)
+    }
+    do {
+        let start = Date()
+        let joulesStart = gpuEnergyMeter?.joules()
+        var table = try SplatTable.readPLY(url: inURL)
+        if args.count > 4, let degree = Int(args[4]), (0...3).contains(degree) {
+            table = table.reducingSH(to: degree)
+        }
+        let iterations = ProcessInfo.processInfo.environment["SOG_ITERATIONS"].flatMap(Int.init) ?? 10
+        try SplatExporter.write(table, format: format, to: outURL,
+                                options: .init(shIterations: iterations, log: { print("  " + $0) }))
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int) ?? 0
+        print(String(format: "convert: %d splats (SH degree %d, background %d) → %@ %.1f MB in %.2fs",
+                     table.count, table.shDegree, table.backgroundCount, format.displayName,
+                     Double(bytes) / 1e6, Date().timeIntervalSince(start)))
+        if let j0 = joulesStart, let j1 = gpuEnergyMeter?.joules() {
+            print(String(format: "  GPU energy: %.1f J", j1 - j0))
+        }
+        print("wrote \(outURL.path)")
+    } catch {
+        print("convert failed: \(error)"); exit(1)
     }
 
 case "cull":

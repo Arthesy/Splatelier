@@ -12,6 +12,8 @@ struct CaptureView: View {
     @StateObject private var vm = CaptureViewModel()
     @State private var showDiscardConfirm = false
     @State private var showFrameReview = false
+    /// LiDAR depth during capture (LiDAR devices only). Still experimental, so off by default.
+    @AppStorage("capture.useLiDAR") private var useLiDAR = false
 
     // MARK: crash recovery
     /// Preserved dataset (*.dataset) left over from a previous crash. Detected at launch.
@@ -137,6 +139,10 @@ struct CaptureView: View {
                     if let err = vm.errorMessage { errorRow(err) }
                 }
                 .frame(maxHeight: .infinity, alignment: .top)
+                if ARKitCaptureSession.isLiDARAvailable {
+                    Toggle("LiDAR depth (experimental)", isOn: $useLiDAR)
+                        .padding(.horizontal)
+                }
             }
             controlRow
         }
@@ -428,7 +434,7 @@ struct CaptureView: View {
     @ViewBuilder
     private var captureStartButton: some View {
         let hasScene = vm.capturedScene != nil
-        let button = Button(action: { if hasScene { showDiscardConfirm = true } else { vm.start() } }) {
+        let button = Button(action: { if hasScene { showDiscardConfirm = true } else { vm.start(useLiDAR: useLiDAR) } }) {
             Label(hasScene ? "Capture again" : "Start capture",
                   systemImage: hasScene ? "arrow.counterclockwise" : "record.circle")
                 .frame(maxWidth: .infinity)

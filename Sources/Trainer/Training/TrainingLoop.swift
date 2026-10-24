@@ -228,14 +228,14 @@ extension TrainingDriver {
                 if needsCache {
                     let output = trainer.stepWithCache(
                         camera: stepCamera, targetImage: stepTarget, shDegree: shDegree,
-                        geometry: geometry, mvsDepth: v.mvsDepth
+                        geometry: geometry, mvsDepth: v.mvsDepth, surfaceMask: v.surfaceMask
                     )
                     return (output.loss, output.cache)
                 } else {
                     return (
                         trainer.step(
                             camera: stepCamera, targetImage: stepTarget, shDegree: shDegree,
-                            geometry: geometry, mvsDepth: v.mvsDepth
+                            geometry: geometry, mvsDepth: v.mvsDepth, surfaceMask: v.surfaceMask
                         ),
                         nil
                     )
@@ -502,7 +502,7 @@ extension TrainingDriver {
                 let v = views[session.viewSampler.sample(using: &rng)]
                 // The scale cap is applied inside trainer.step.
                 return trainer.step(camera: v.camera, targetImage: v.imageFloat, shDegree: shDegree,
-                                    geometry: geometry, mvsDepth: v.mvsDepth)
+                                    geometry: geometry, mvsDepth: v.mvsDepth, surfaceMask: v.surfaceMask)
             }
             lastStepSeconds = Date().timeIntervalSince(t0)
             history.append(loss)

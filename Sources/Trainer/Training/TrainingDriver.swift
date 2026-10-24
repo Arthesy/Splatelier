@@ -105,12 +105,9 @@ public enum TrainingDriver {
         images: [MLXArray],
         sparsePoints: [SIMD3<Float>],
         parameters: CostVolumeMVS.Parameters,
-        // Uniform value given to MVS points in Operator G's confidence-weighted fusion. Already
-        // filtered in CostVolumeMVS, so a middling value.
-        mvsConfidence: Float = 0.6,
         depthMaps: ((CostVolumeMVS.DepthView) -> Void)? = nil,
         log: (String) -> Void = { print($0) }
-    ) -> (positions: MLXArray, colors: MLXArray, confidences: MLXArray)? {
+    ) -> (positions: MLXArray, colors: MLXArray, confidences: MLXArray, observedDepths: MLXArray)? {
         precondition(viewmats.count == intrinsics.count
                      && intrinsics.count == images.count,
                      "viewmats / intrinsics / images counts must match")
@@ -155,9 +152,10 @@ public enum TrainingDriver {
             + "per-frame min=\(pcMin) mean=\(pcMean) max=\(pcMax), "
             + "zero-frames=\(frameCounts.count - positiveCounts.count)")
         guard denseCount > 0 else { return nil }
-        let confidences = MLXArray([Float](repeating: mvsConfidence, count: denseCount), [denseCount])
-        eval(confidences)
-        return (positions: mvs.positions, colors: mvs.colors, confidences: confidences)
+        // Each point's weight in Operator G's confidence-weighted fusion is the peak-ratio
+        // confidence of the pixels behind it.
+        return (positions: mvs.positions, colors: mvs.colors, confidences: mvs.confidences,
+                observedDepths: mvs.observedDepths)
     }
 
     /// Reads a COLMAP scene, initializes from its point cloud, and trains for `iterations`

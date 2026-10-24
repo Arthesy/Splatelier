@@ -21,6 +21,9 @@ public struct TrainView {
     public let weight: Float
     /// This view's MVS depth map, for the geometric regularization (nil without one).
     public var mvsDepth: DepthTarget?
+    /// [gh, gw] float32 grid over the image, 1 where a depth sensor (LiDAR) measured a surface.
+    /// Those pixels stay out of the bg-SH background mask (nil: no sensor).
+    public var surfaceMask: MLXArray?
 
     public init(camera: Camera, image: MLXArray, name: String, weight: Float = 1.0, mvsDepth: DepthTarget? = nil) {
         self.camera = camera

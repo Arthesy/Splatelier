@@ -36,3 +36,29 @@ import Testing
         #expect(la > 0, "the mask should cover some pixels")
     }
 }
+
+/// Pixels marked as a measured surface never count as background: with every pixel marked, the
+/// alpha loss vanishes even where the target matches the background exactly.
+@Test func alphaTermsSkipSurfacePixels() {
+    let h = 8, w = 8
+    let bg = MLXRandom.uniform(low: 0, high: 1, [h, w, 3])
+    let vRender = MLXArray.zeros([h, w, 3])
+    let alpha = MLXArray.ones([h * w])
+    let open = GaussianTrainer.alphaTerms(vRender: vRender, bg: bg, target: bg, renderAlpha: alpha, weight: 0.15)
+    let marked = GaussianTrainer.alphaTerms(vRender: vRender, bg: bg, target: bg, renderAlpha: alpha, weight: 0.15,
+                                            surface: MLXArray.ones([h, w]))
+    #expect(open.loss.item(Float.self) > 0)
+    #expect(marked.loss.item(Float.self) == 0)
+    #expect(MLX.abs(marked.vAlpha).max().item(Float.self) == 0)
+}
+
+/// The nearest-cell upsampling keeps each grid cell's value over its share of the image.
+@Test func surfaceMaskUpsamplesByNearestCell() {
+    let grid = MLXArray([Float(1), 0, 0, 1], [2, 2])
+    let up = GaussianTrainer.upsampleNearest(grid, height: 4, width: 6)
+    #expect(up.shape == [4, 6])
+    #expect(up.asArray(Float.self) == [1, 1, 1, 0, 0, 0,
+                                       1, 1, 1, 0, 0, 0,
+                                       0, 0, 0, 1, 1, 1,
+                                       0, 0, 0, 1, 1, 1])
+}

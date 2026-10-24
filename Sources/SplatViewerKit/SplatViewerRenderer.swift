@@ -69,6 +69,15 @@ final class SplatViewerRenderer: NSObject, MTKViewDelegate {
     private var seedChunk: SplatChunk?
     /// A ray test is in flight. Don't stack another; taps until it finishes are dropped.
     private var isPicking = false
+    // Crop: the foreground splats as loaded, the background (which crops leave alone, but a shared
+    // PLY keeps), the edits (indices kept) and the handle being dragged. The foreground chunk is
+    // rebuilt from the edits after every change; rebuilds run one after another.
+    private var gsSourcePoints: [SplatPoint] = []
+    private var backgroundSourcePoints: [SplatPoint] = []
+    private var cropEdits = SplatViewerCropEdits(count: 0)
+    private var cropRebuild: Task<Void, Never>?
+    private var sourceName = "splats"
+    private var activeCropHandle: SplatViewerCropHandle?
 
     init?(view: MTKView, model: SplatViewerModel) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice(),
@@ -117,6 +126,13 @@ final class SplatViewerRenderer: NSObject, MTKViewDelegate {
         model.onNeedsRedraw = { [weak self] in self?.requestRedraw() }
         model.onMeasureTap = { [weak self] in self?.measureTap(normalized: $0) }
         model.onFocusTap = { [weak self] in self?.focusTap(normalized: $0) }
+        model.onCropHandleBegin = { [weak self] in self?.beginCropDrag(normalized: $0) ?? false }
+        model.onCropHandleDrag = { [weak self] in self?.cropDrag(normalizedDelta: $0) }
+        model.onCropHandleEnd = { [weak self] in self?.endCropDrag() }
+        model.onCropApply = { [weak self] in self?.applyCrop() }
+        model.onCropUndo = { [weak self] in self?.undoCrop() }
+        model.onCropRestore = { [weak self] in self?.restoreCrop() }
+        model.onColorGradeApply = { [weak self] grade in self?.applyColorGrade(grade) }
         #if os(iOS)
         // Redraw once when returning from background (if left paused, the screen can stay stale
         // after resuming).
@@ -124,6 +140,13 @@ final class SplatViewerRenderer: NSObject, MTKViewDelegate {
             self, selector: #selector(willEnterForeground),
             name: UIApplication.willEnterForegroundNotification, object: nil)
         #endif
+    }
+
+    /// Re-bakes the foreground with the current grade. Shares the crop path, so the chunk, the
+    /// Share entry and the rebuild order all stay in step with the edits.
+    private func applyColorGrade(_ grade: SplatViewerColorGrade) {
+        guard isLoaded else { return }
+        commitCropEdits()
     }
 
     #if os(iOS)
@@ -193,6 +216,14 @@ final class SplatViewerRenderer: NSObject, MTKViewDelegate {
                 let seedPoints = seed.scene
                 // Camera markers are normally only on the seed side, but allow both.
                 let cameraPoints = main.camera + seed.camera
+                self.gsSourcePoints = gsPoints
+                self.backgroundSourcePoints = backgroundPoints
+                self.cropEdits = SplatViewerCropEdits(count: gsPoints.count)
+                self.sourceName = url?.deletingPathExtension().lastPathComponent ?? "splats"
+                if !gsPoints.isEmpty {
+                    self.model.cropRegion = SplatViewerCropRegion.initial(
+                        shape: self.model.cropShape, positions: gsPoints.map(\.position))
+                }
                 if let mesh {
                     do {
                         self.meshLayer = try SplatViewerMeshLayer(
@@ -403,6 +434,142 @@ final class SplatViewerRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    // MARK: - Crop
+
+    /// How close, in pixels, a touch must be to a handle to grab it.
+    /// How far a touch may be from a handle and still grab it, as a fraction of the shorter side of
+    /// the drawable. A fixed pixel count shrinks to about 15 points on a Retina iPhone.
+    private static let cropGrabFraction: Float = 0.09
+
+    private var pixelSize: SIMD2<Float> {
+        SIMD2(Float(drawableSize.width), Float(drawableSize.height))
+    }
+
+    /// Start of a drag (normalized coordinates). Grabs the nearest handle within reach. false leaves
+    /// the drag to the camera.
+    func beginCropDrag(normalized point: SIMD2<Float>) -> Bool {
+        guard model.isCropping, isLoaded, let region = model.cropRegion else { return false }
+        let camera = self.camera()
+        let size = pixelSize
+        let nearest = region.handles(camera: camera).compactMap { item -> (SplatViewerCropHandle, Float)? in
+            guard let s = camera.project(cameraSpace: camera.cameraSpace(item.position)) else { return nil }
+            return (item.handle, simd_distance(s * size, point * size))
+        }.min { $0.1 < $1.1 }
+        let reach = Self.cropGrabFraction * min(size.x, size.y)
+        guard let nearest, nearest.1 <= reach else { return false }
+        activeCropHandle = nearest.0
+        return true
+    }
+
+    /// Drag of the grabbed handle. `delta` is the touch movement normalized by the view size.
+    func cropDrag(normalizedDelta delta: SIMD2<Float>) {
+        guard let handle = activeCropHandle, let region = model.cropRegion else { return }
+        model.cropRegion = region.dragged(
+            handle, byPixels: delta * pixelSize, camera: camera(), viewSize: pixelSize)
+    }
+
+    func endCropDrag() {
+        activeCropHandle = nil
+    }
+
+    /// Removes what the region doesn't keep (or keeps, if "remove inside" is off).
+    func applyCrop() {
+        guard isLoaded, let region = model.cropRegion else { return }
+        let keepsInside = model.cropKeepsInside
+        let source = gsSourcePoints
+        switch cropEdits.apply({ region.contains(source[Int($0)].position) == keepsInside }) {
+        case .applied:
+            commitCropEdits()
+        case .unchanged:
+            model.showCropNotice("Nothing to remove here")
+        case .emptied:
+            model.showCropNotice("That would remove every splat")
+        }
+    }
+
+    func undoCrop() {
+        guard isLoaded else { return }
+        cropEdits.undo()
+        commitCropEdits()
+    }
+
+    /// Back to every splat as loaded.
+    func restoreCrop() {
+        guard isLoaded else { return }
+        cropEdits.restoreAll()
+        commitCropEdits()
+    }
+
+    /// Updates the count, the Share entry and the foreground chunk after the edits changed.
+    private func commitCropEdits() {
+        let kept = cropEdits.kept
+        let source = gsSourcePoints
+        let background = backgroundSourcePoints
+        let grade = model.colorGrade
+        model.setLoadState(.loaded(count: kept.count))
+        // The Edited entry covers a crop and a colour grade alike; either one changes the splats.
+        let isEdited = cropEdits.isEdited || !grade.isIdentity
+        let shareItem = isEdited
+            ? Self.editedShareItem(
+                kept: kept, source: source, background: background, grade: grade,
+                export: model.cropExport, name: sourceName)
+            : nil
+        model.setCropState(edited: cropEdits.isEdited, canUndo: cropEdits.canUndo, shareItem: shareItem)
+        rebuildGSChunk(kept: kept, source: source, grade: grade)
+    }
+
+    /// Replaces the foreground chunk with the kept splats, graded. Rebuilds run one after another.
+    /// The new chunk is built off the main actor and added before the old one is removed, so the
+    /// Apply doesn't stall the view and the splats don't drop out while it builds.
+    private func rebuildGSChunk(kept: [UInt32], source: [SplatPoint], grade: SplatViewerColorGrade) {
+        guard let renderer else { return }
+        let previous = cropRebuild
+        let device = self.device
+        cropRebuild = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            let enabled = self.appliedGS
+            let built = await Task.detached(priority: .userInitiated) { () -> Result<SplatChunk, Error> in
+                Result { try SplatChunk(device: device, from: kept.map { grade.apply(to: source[Int($0)]) }) }
+            }.value
+            switch built {
+            case .success(let chunk):
+                let newID = await renderer.addChunk(chunk, enabled: enabled)
+                let oldID = self.gsChunkID
+                self.gsChunk = chunk
+                self.gsChunkID = newID
+                if let oldID { await renderer.removeChunk(oldID) }
+            case .failure:
+                if let oldID = self.gsChunkID { await renderer.removeChunk(oldID) }
+                self.gsChunk = nil
+                self.gsChunkID = nil
+                self.model.showCropNotice("Couldn't rebuild the splats")
+            }
+            self.requestRedraw()
+        }
+    }
+
+    /// Share entry that writes the edited splats as PLY. The arrays are values, so the file is
+    /// written from the edits as they were when the entry was made.
+    private static func editedShareItem(
+        kept: [UInt32], source: [SplatPoint], background: [SplatPoint], grade: SplatViewerColorGrade,
+        export: SplatViewerCropExport?, name: String
+    ) -> SplatViewerShareItem {
+        // Every option writes the edited PLY when it is picked. The PLY is the first option, and
+        // each format the app offers is converted from that same PLY.
+        let writePLY: @Sendable () async throws -> URL = {
+            try await writeEditedPLY(kept.map { grade.apply(to: source[Int($0)]) } + background, name: name)
+        }
+        var options = [SplatViewerShareItem.Option(title: "PLY", prepare: writePLY)]
+        for format in export?.formats ?? [] {
+            options.append(SplatViewerShareItem.Option(title: format.title, prepare: {
+                guard let export else { return try await writePLY() }
+                return try await export.convert(try await writePLY(), format.fileExtension)
+            }))
+        }
+        return SplatViewerShareItem(title: "Edited splats", systemImage: "slider.horizontal.3", options: options)
+    }
+
     // MARK: - Double-tap zoom
 
     /// Zoom factor per double tap.
@@ -540,6 +707,11 @@ final class SplatViewerRenderer: NSObject, MTKViewDelegate {
             model.isMeasuring
                 ? SplatMeasureProjection.frame(points: model.measurePoints, camera: camera)
                 : SplatMeasureProjection.Frame())
+        if model.isCropping, let region = model.cropRegion {
+            model.cropProjection.update(SplatCropFrame.make(region: region, camera: camera))
+        } else {
+            model.cropProjection.update(SplatCropFrame())
+        }
         let colorTexture = view.multisampleColorTexture ?? drawable.texture
         let colorStoreAction: MTLStoreAction = view.multisampleColorTexture == nil ? .store : .multisampleResolve
         if let meshLayer, let depthTexture = view.depthStencilTexture {

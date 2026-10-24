@@ -148,7 +148,12 @@ final class SplatViewerModel: ObservableObject {
     /// Measure mode. While on, taps place measurement points and the placed segments are shown
     /// (rotation etc. still work). Turning it off keeps the points, and they are shown again the
     /// next time it is turned on.
-    @Published var isMeasuring = false { didSet { onNeedsRedraw?() } }
+    @Published var isMeasuring = false {
+        didSet {
+            if isMeasuring { isCropping = false }
+            onNeedsRedraw?()
+        }
+    }
     /// Placed measurement points (world coordinates; meters for capture data). Each pair is one
     /// segment; with an odd count the last is just a start point.
     @Published private(set) var measurePoints: [SIMD3<Float>] = [] { didSet { onNeedsRedraw?() } }
@@ -186,6 +191,72 @@ final class SplatViewerModel: ObservableObject {
         }
     }
 
+    // MARK: Crop
+
+    /// Crop mode. Handles of the region can be dragged; a drag that doesn't start on a handle still
+    /// orbits. Turning it on turns measure mode off.
+    @Published var isCropping = false {
+        didSet {
+            if isCropping { isMeasuring = false; isColoring = false }
+            onNeedsRedraw?()
+        }
+    }
+    /// Shape of the region. Switching keeps its center and size (see `setCropShape`).
+    @Published private(set) var cropShape: SplatViewerCropShape = .box
+    /// true keeps the splats inside the region; false removes them.
+    @Published var cropKeepsInside = true
+    /// Colour panel open. It and Crop are never on together: opening one closes the other.
+    @Published var isColoring = false {
+        didSet {
+            if isColoring { isCropping = false }
+            onNeedsRedraw?()
+        }
+    }
+    /// Region in world coordinates. Written by the renderer while a handle is dragged.
+    var cropRegion: SplatViewerCropRegion? { didSet { onNeedsRedraw?() } }
+    /// Whether a crop has been applied (the cropped result differs from the loaded file).
+    @Published private(set) var cropEdited = false
+    @Published private(set) var cropCanUndo = false
+    /// Share entry for the cropped splats (PLY). nil until a crop is applied.
+    @Published private(set) var cropShareItem: SplatViewerShareItem?
+    /// Transient hint, e.g. when a crop would remove nothing or everything.
+    @Published private(set) var cropNotice: String?
+    let cropProjection = SplatCropProjection()
+    /// Drag of a crop handle (normalized coordinates). The begin returns whether a handle was grabbed.
+    /// Set by the renderer.
+    var onCropHandleBegin: ((SIMD2<Float>) -> Bool)?
+    var onCropHandleDrag: ((SIMD2<Float>) -> Void)?
+    var onCropHandleEnd: (() -> Void)?
+    var onCropApply: (() -> Void)?
+    var onCropUndo: (() -> Void)?
+    var onCropRestore: (() -> Void)?
+    private var cropNoticeID = 0
+
+    /// Changes the shape of the region, keeping its center and size.
+    func setCropShape(_ shape: SplatViewerCropShape) {
+        guard shape != cropShape else { return }
+        cropShape = shape
+        cropRegion = cropRegion?.converted(to: shape)
+    }
+
+    func setCropState(edited: Bool, canUndo: Bool, shareItem: SplatViewerShareItem?) {
+        cropEdited = edited
+        cropCanUndo = canUndo
+        cropShareItem = shareItem
+    }
+
+    /// Shows the hint for just 2 seconds.
+    func showCropNotice(_ text: String) {
+        cropNoticeID += 1
+        let id = cropNoticeID
+        cropNotice = text
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self, self.cropNoticeID == id else { return }
+            self.cropNotice = nil
+        }
+    }
+
     // orbit camera (written by gestures, read by the renderer). `framed*` are the values at framing
     // time.
     var azimuth: Float = 0 { didSet { onNeedsRedraw?() } }
@@ -196,6 +267,23 @@ final class SplatViewerModel: ObservableObject {
     var center = SIMD3<Float>(0, 0, 0) { didSet { onNeedsRedraw?() } }
     /// Receiver of double taps (normalized coordinates). Set by the renderer.
     var onFocusTap: ((SIMD2<Float>) -> Void)?
+
+    /// Formats and conversions offered for a cropped result. Set by the screen that made the viewer.
+    let cropExport: SplatViewerCropExport?
+    init(cropExport: SplatViewerCropExport? = nil) {
+        self.cropExport = cropExport
+    }
+
+    /// The colour grade on the foreground. The renderer bakes it in through `onColorGradeApply`.
+    @Published private(set) var colorGrade = SplatViewerColorGrade.identity
+    var onColorGradeApply: ((SplatViewerColorGrade) -> Void)?
+
+    func applyColorGrade(_ grade: SplatViewerColorGrade) {
+        guard grade != colorGrade else { return }
+        colorGrade = grade
+        onColorGradeApply?(grade)
+    }
+
     private(set) var framedDistance: Float = 4
     private(set) var framedCenter = SIMD3<Float>(0, 0, 0)
     private(set) var previewCamera: SplatViewerPreviewCamera?

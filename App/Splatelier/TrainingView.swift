@@ -159,6 +159,7 @@ struct TrainingView: View {
             meshURL: vm.meshOBJURL,
             name: CaptureMetadataName.load(for: target.plyURL),
             shareItems: shareItems,
+            cropExport: SplatExportShare.cropExport,
             onTrainMore: vm.canContinueTraining && !vm.isGeneratingMesh ? {
                 // Back to this screen's log, then continue; the viewer opens again when it ends.
                 vm.viewerTarget = nil

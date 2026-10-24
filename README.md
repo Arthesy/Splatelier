@@ -36,7 +36,7 @@ and compiled to Metal.
   from the trained scene. Files are available in the Files app.
 - **Mac tools**: retrain a capture from the app on a Mac, train and evaluate on COLMAP scenes, and
   inspect PLY files from the command line. `splatelier convert` turns a PLY into compressed PLY, SPZ,
-  .splat, glTF (GLB) or SOG.
+  .splat, glTF (GLB), SOG or OpenUSD (.usda, ParticleField3DGaussianSplat from OpenUSD v26.03).
 
 ## Requirements
 

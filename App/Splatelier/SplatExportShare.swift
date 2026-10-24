@@ -10,7 +10,7 @@ import Trainer
 
 enum SplatExportShare {
     /// Formats offered besides the PLY itself, in menu order.
-    private static let convertedFormats: [SplatExportFormat] = [.compressedPly, .spz, .splat, .glb, .sog]
+    private static let convertedFormats: [SplatExportFormat] = [.compressedPly, .spz, .splat, .glb, .sog, .usda]
 
     /// The Share entry for the capture's GS file. Only a PLY can be converted (it is read back in
     /// full); anything else, such as an imported .spz, is shared as it is.

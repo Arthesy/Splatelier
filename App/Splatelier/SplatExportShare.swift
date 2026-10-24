@@ -27,21 +27,48 @@ enum SplatExportShare {
         return SplatViewerShareItem(title: title, systemImage: "cube.fill", options: options)
     }
 
-    /// Converts on a background thread and returns the file in a fresh temporary directory (the
-    /// share sheet reads it from there). Earlier exports are deleted first.
-    private static func export(_ plyURL: URL, as format: SplatExportFormat) async throws -> URL {
-        try await Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
-            let root = fm.temporaryDirectory.appendingPathComponent("splat-export", isDirectory: true)
-            try? fm.removeItem(at: root)
-            let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let out = format.url(replacingExtensionOf: dir.appendingPathComponent(plyURL.lastPathComponent))
+    /// Every format a capture's splats can be shared in, PLY (as trained) first.
+    static let formats: [SplatExportFormat] = [.ply] + convertedFormats
 
+    /// The picker's wording: the format and the file extension it gives.
+    static func label(for format: SplatExportFormat) -> String {
+        switch format {
+        case .ply: return "PLY as trained (.ply)"
+        default: return "\(format.displayName) (.\(format.fileExtension))"
+        }
+    }
+
+    /// A fresh temporary directory for one share (the share sheet reads the files from there).
+    /// Earlier exports are deleted first.
+    static func makeExportDirectory() throws -> URL {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("splat-export", isDirectory: true)
+        try? fm.removeItem(at: root)
+        let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// The splats file to share in `format`: the file itself for the PLY as trained, and for
+    /// anything that is not a PLY (an imported .spz, say); otherwise a converted copy in `dir`.
+    static func file(for url: URL, as format: SplatExportFormat, in dir: URL) async throws -> URL {
+        if format == .ply || url.pathExtension.lowercased() != "ply" { return url }
+        return try await convert(url, as: format, into: dir)
+    }
+
+    /// Converts on a background thread and returns the file in `dir`.
+    private static func convert(_ plyURL: URL, as format: SplatExportFormat, into dir: URL) async throws -> URL {
+        try await Task.detached(priority: .userInitiated) {
+            let out = format.url(replacingExtensionOf: dir.appendingPathComponent(plyURL.lastPathComponent))
             // readPLY already drops the zero padding above the trained SH degree.
             let table = try SplatTable.readPLY(url: plyURL)
             try SplatExporter.write(table, format: format, to: out)
             return out
         }.value
+    }
+
+    /// For the viewer's Share menu: a conversion made when the option is picked.
+    private static func export(_ plyURL: URL, as format: SplatExportFormat) async throws -> URL {
+        try await convert(plyURL, as: format, into: try makeExportDirectory())
     }
 }

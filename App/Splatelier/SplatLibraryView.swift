@@ -51,15 +51,21 @@ struct SplatLibraryView: View {
                 ContentUnavailableView {
                     Label("No captures yet", systemImage: "cube.transparent")
                 } description: {
-                    Text("Trained scenes appear here.\nTap + at the top right to import .ply / .splat / .spz files.")
+                    Text("Trained scenes appear here.\nTap Import at the top right to add .ply / .splat / .spz files.")
                 }
             } else {
                 List {
                     ForEach(items) { item in
                         rowContainer(item)
+                            // The rows would draw a black group box behind each card; let the
+                            // indigo show through and space the cards instead of ruling them off.
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
                     }
                     .onDelete(perform: deleteAt)
                 }
+                .listStyle(.plain)
             }
         }
         .navigationTitle("Library")
@@ -133,15 +139,31 @@ struct SplatLibraryView: View {
             if selectMode {
                 Button(selectAllTitle) { toggleSelectAll() }
             } else {
-                Button { importing = true } label: {
-                    Image(systemName: "plus")
-                }
+                // Text, like Select on the left: the bar shows only the icon of a Label.
+                Button("Import") { importing = true }
             }
         }
     }
 
     private var selectModeTitle: String { selectMode ? "Done" : "Select" }
     private var selectAllTitle: String { selection.count == items.count ? "Deselect all" : "Select all" }
+
+    /// What the viewer's Share menu offers: the GS, the mesh, and the training log if the capture
+    /// folder has one.
+    private func shareItems(for item: CaptureItem) -> [SplatViewerShareItem] {
+        var items = [SplatExportShare.item(for: item.mainURL)]
+        if let mesh = item.meshURL {
+            items.append(SplatViewerShareItem(title: "Mesh (OBJ)", systemImage: "triangle", url: mesh))
+        }
+        // The training log and the mesh log go out together as "Log".
+        let base = item.mainURL.deletingPathExtension()
+        let logs = [base.appendingPathExtension("log"), URL(fileURLWithPath: base.path + "_mesh.log")]
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        if !logs.isEmpty {
+            items.append(SplatViewerShareItem(title: "Log", systemImage: "doc.text", urls: logs))
+        }
+        return items
+    }
 
     // MARK: - Rows
 
@@ -155,75 +177,100 @@ struct SplatLibraryView: View {
             }
             .buttonStyle(.plain)
         } else {
-            NavigationLink {
-                SplatViewerScreen(
-                    url: item.mainURL,
-                    seedURL: item.seedURL,
-                    meshURL: item.meshURL,
-                    name: item.name,
-                    onRename: { newName in
-                        CaptureMetadataName.save(newName, for: item.mainURL)
-                        reload()
-                    }
-                )
-            } label: {
+            // The link sits invisibly over the card: a visible NavigationLink adds a ">" to the
+            // right of the row, which pushed the card's "…" onto its edge.
+            ZStack {
                 card(item, selected: false)
-            }
-            .contextMenu {
-                Button {
-                    beginRename(item)
+                NavigationLink {
+                    SplatViewerScreen(
+                        url: item.mainURL,
+                        seedURL: item.seedURL,
+                        meshURL: item.meshURL,
+                        name: item.name,
+                        shareItems: shareItems(for: item),
+                        onRename: { newName in
+                            CaptureMetadataName.save(newName, for: item.mainURL)
+                            reload()
+                        }
+                    )
                 } label: {
-                    Label("Rename", systemImage: "pencil")
+                    EmptyView()
                 }
-                if let record = item.settings {
-                    Button {
-                        settingsSheet = SettingsSheetData(
-                            id: item.id, title: item.displayName, record: record)
-                    } label: {
-                        Label("View training settings", systemImage: "slider.horizontal.3")
-                    }
-                }
-                // Only the deliverable GS (= main) PLY is shared; the mesh has its own entry.
-                ShareLink(item: item.mainURL) {
-                    Label("Share", systemImage: "square.and.arrow.up")
-                }
-                if let meshURL = item.meshURL {
-                    ShareLink(item: meshURL) {
-                        Label("Share mesh", systemImage: "cube")
-                    }
-                }
-                Button(role: .destructive) {
-                    delete(item)
-                } label: {
-                    Label("Delete", systemImage: "trash")
-                }
+                .opacity(0)
             }
+            .contextMenu { itemActions(item) }
+            // Same actions as the long press, on a visible button inside the card's bottom right.
+            .overlay(alignment: .bottomTrailing) {
+                Menu {
+                    itemActions(item)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                        .shadow(color: .black.opacity(0.5), radius: 2)
+                }
+                .accessibilityLabel("More actions")
+                .padding(.trailing, 4)
+            }
+        }
+    }
+
+    /// Per-capture actions, shared by the long-press menu and the "…" button.
+    @ViewBuilder
+    private func itemActions(_ item: CaptureItem) -> some View {
+        Button {
+            beginRename(item)
+        } label: {
+            Label("Rename", systemImage: "pencil")
+        }
+        if let record = item.settings {
+            Button {
+                settingsSheet = SettingsSheetData(
+                    id: item.id, title: item.displayName, record: record)
+            } label: {
+                Label("View training settings", systemImage: "slider.horizontal.3")
+            }
+        }
+        // Only the deliverable GS (= main) PLY is shared; the mesh has its own entry.
+        ShareLink(item: item.mainURL) {
+            Label("Share", systemImage: "square.and.arrow.up")
+        }
+        if let meshURL = item.meshURL {
+            ShareLink(item: meshURL) {
+                Label("Share mesh", systemImage: "cube")
+            }
+        }
+        Button(role: .destructive) {
+            delete(item)
+        } label: {
+            Label("Delete", systemImage: "trash")
         }
     }
 
     private func card(_ item: CaptureItem, selected: Bool) -> some View {
         let url = item.mainURL
-        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+        let dateText = values?.contentModificationDate?.formatted(date: .abbreviated, time: .shortened)
         return ZStack(alignment: .bottomLeading) {
             previewImage(for: url)
             LinearGradient(
-                colors: [.clear, .black.opacity(0.62)],
+                colors: [.clear, Color.appBackground.opacity(0.85)],
                 startPoint: .center,
                 endPoint: .bottom
             )
+            // The name and the date, nothing else. Without a name the date is the title.
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.displayName)
-                    .font(.caption.weight(.semibold).monospaced())
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text(metadataText(values, hasSeed: item.seedURL != nil))
-                    .font(.caption2.monospacedDigit())
-                    .lineLimit(1)
-                if let metrics = item.metrics {
-                    // Smooth loss (rolling mean) at the final iter.
-                    Label(String(format: "smooth loss %.5f", metrics.finalSmoothLoss),
-                          systemImage: "chart.line.downtrend.xyaxis")
-                        .font(.caption2.monospacedDigit())
+                if let name = item.name {
+                    Text(name)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let dateText { Text(dateText).font(.caption) }
+                } else {
+                    Text(dateText ?? item.displayName)
+                        .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                 }
             }
@@ -239,7 +286,7 @@ struct SplatLibraryView: View {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                     .font(.title2)
                     .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, selected ? Color.accentColor : Color.black.opacity(0.35))
+                    .foregroundStyle(.white, selected ? Color.kikyoFill : Color.black.opacity(0.35))
                     .padding(8)
                     .shadow(color: .black.opacity(0.5), radius: 2)
             }
@@ -437,20 +484,6 @@ struct SplatLibraryView: View {
         (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
     }
 
-    private func metadataText(_ values: URLResourceValues?, hasSeed: Bool) -> String {
-        var parts: [String] = []
-        if let date = values?.contentModificationDate {
-            parts.append(date.formatted(date: .abbreviated, time: .shortened))
-        }
-        if let size = values?.fileSize {
-            parts.append(byteString(size))
-        }
-        if hasSeed {
-            parts.append("seed+cameras")
-        }
-        return parts.joined(separator: "  ")
-    }
-
     private func importCopy(_ src: URL) {
         let scoped = src.startAccessingSecurityScopedResource()
         defer { if scoped { src.stopAccessingSecurityScopedResource() } }
@@ -513,9 +546,6 @@ struct SplatLibraryView: View {
         }
     }
 
-    private func byteString(_ bytes: Int) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
-    }
 }
 
 private struct TrainingSettingsSheet: View {
@@ -538,6 +568,7 @@ private struct TrainingSettingsSheet: View {
                     }
                 }
             }
+            .appBackground()
             .navigationTitle("Training settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

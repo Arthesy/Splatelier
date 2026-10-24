@@ -48,7 +48,7 @@ func usage() {
     print("           0 = all frames)")
     print("         THERMAL_SIM=nominal|fair|serious fixes the thermal guard's thermalState (reproduces the serious slow-down)")
     print("         GEO_REG=0 turns off the geometric regularization (on as in the app)")
-    print("         MESH_OBJ=<path.obj> after training, builds the mesh as the app's Generate mesh: from the trained")
+    print("         MESH_OBJ=<path.obj> after training, builds the mesh as the app does after training: from the trained")
     print("           Gaussians' surface depth (from training's MVS depth with GEO_REG=0); MESH_VOXEL=<m> (default")
     print("           0.005) / MESH_TRUNC=<voxels> (default 4) / MESH_MIN_WEIGHT (default 3) /")
     print("           MESH_MIN_COMPONENT=<tris> (default 200) / MESH_MAX_VOXELS (default 12M)")
@@ -438,7 +438,7 @@ case "train-capture":
                 training: split.training, heldOut: split.heldOut,
                 to: outputPLY.deletingPathExtension().appendingPathExtension("split.json"))
         }
-        // MESH_OBJ=<path.obj>: after training, build the mesh as the app's Generate mesh does
+        // MESH_OBJ=<path.obj>: after training, build the mesh as the app does
         // (MESH_* knobs in MeshCapture.swift).
         if let meshOBJ = env["MESH_OBJ"].map({ URL(fileURLWithPath: $0) }),
            !(try writeCaptureMesh(geometry: geometry, session: result.session,

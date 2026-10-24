@@ -138,6 +138,7 @@ public enum CaptureTraining {
         // geometry's depth maps). nil disables it.
         geometryRegularization: GeometryRegularization? = AppPreset.geometryRegularization,
         onThermalThrottle: ((ThermalThrottleState) -> Void)? = nil,
+        onPreview: ((TrainingPreviewFrame) -> Void)? = nil,
         onSnapshot: ((GaussianModel, Int) -> Void)? = nil,
         log: (String) -> Void = { print($0) }
     ) throws -> TrainingDriver.Result {
@@ -238,6 +239,7 @@ public enum CaptureTraining {
             useEarlySH: true,
             geometryRegularization: geometryRegularization,
             onThermalThrottle: onThermalThrottle,
+            onPreview: onPreview,
             onSnapshot: onSnapshot, log: log
         )
         if !heldOutFrames.isEmpty, let trainer = result.session?.trainer {

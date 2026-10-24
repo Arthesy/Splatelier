@@ -39,3 +39,6 @@ Package.resolved
 /bear_*.png
 /pocket_studio_logo_*.png
 output/
+
+# Fonts for scripts/media (run scripts/media/fetch_fonts.sh to fetch)
+/scripts/media/fonts/

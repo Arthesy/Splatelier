@@ -30,9 +30,9 @@ extension CaptureTraining {
         public static let fineResample: (num: Int, den: Int) = (2, 3)
         /// Geometric regularization (G³S surface depth with normal consistency and the MVS depth,
         /// every 8 iterations from 30% of training), so the Gaussians' surface depth gives a flat
-        /// TSDF mesh (the app's Generate mesh), at a small cost in GPU energy and held-out PSNR.
+        /// TSDF mesh (generated after training in the app), at a small cost in GPU energy and held-out PSNR.
         public static let geometryRegularization: GeometryRegularization? = GeometryRegularization()
-        /// Generate mesh: 5mm voxels, at most 12 million allocated (≈ 145MB, to fit device memory;
+        /// The app's mesh after training: 5mm voxels, at most 12 million allocated (≈ 145MB, to fit device memory;
         /// beyond that the voxel size is widened automatically).
         public static let meshParameters = CaptureMeshing.Parameters(
             tsdf: TSDFFusion.Parameters(voxelSize: 0.005, maxVoxels: 12_000_000, voxelsPerDispatch: 1_000_000))

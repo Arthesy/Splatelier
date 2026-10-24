@@ -67,6 +67,16 @@ enum SplatExportShare {
         }.value
     }
 
+    /// The cropped splats' Share options: the PLY (see the viewer) and the same formats as above.
+    static let cropExport = SplatViewerCropExport(
+        formats: convertedFormats.map { SplatViewerCropExport.Format(title: $0.displayName, fileExtension: $0.fileExtension) },
+        convert: { plyURL, fileExtension in
+            guard let format = convertedFormats.first(where: { $0.fileExtension == fileExtension }) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            return try await export(plyURL, as: format)
+        })
+
     /// For the viewer's Share menu: a conversion made when the option is picked.
     private static func export(_ plyURL: URL, as format: SplatExportFormat) async throws -> URL {
         try await convert(plyURL, as: format, into: try makeExportDirectory())

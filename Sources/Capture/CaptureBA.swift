@@ -758,13 +758,13 @@ public enum CaptureBA {
             "BA-touched cams \(observedCams.count)/\(n) (rest restored to ARKit pose), " +
             "sparse points = BA \(baRefinedPoints.count) + ARKit \(scene.sparsePoints.count) = \(combinedSparse.count), " +
             "MVS depth-range = BA \(baRefinedPoints.count) only, " +
-            "lidar = \(scene.lidarPoints.count) (passthrough)")
+            "lidar = \(scene.lidarWorldPoints.count) (moves with the frames)")
         if !distortion.isNone {
             refinedFrames = undistortFrames(refinedFrames, distortion: distortion, log: log)
         }
-        // lidarPoints stay as unprojected with capture-time poses and intrinsics that ignore
-        // distortion. The offset from BA corrections (cm-level) and distortion (a few px at the
-        // image edge) is tolerated.
+        // The frames' LiDAR samples move with the refined poses. They were unprojected with
+        // intrinsics that ignore distortion; the offset (a few px at the image edge) is tolerated.
+        // Old datasets' lidarPoints stay at the capture-time poses.
         return CapturedScene(
             frames: refinedFrames,
             sparsePoints: combinedSparse,

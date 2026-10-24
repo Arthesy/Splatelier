@@ -48,7 +48,12 @@ func usage() {
     print("           0 = all frames)")
     print("         THERMAL_SIM=nominal|fair|serious fixes the thermal guard's thermalState (reproduces the serious slow-down)")
     print("         GEO_REG=0 turns off the geometric regularization (on as in the app)")
-    print("         MESH_OBJ=<path.obj> after training, builds the mesh as the app's Generate mesh: from the trained")
+    print("         POSE_SOURCE=arkit trains on the ARKit poses instead of the BA poses (BA still runs)")
+    print("         SEED_ALLOC=confidence keeps MVS or LiDAR per cell by confidence and caps per cell")
+    print("           (cells SEED_CELL_PX=<pixels across at the seen depth>, default 16; SEED_LIDAR_WEIGHT=<w>, default 1)")
+    print("         LIDAR_COLOR=0 leaves the LiDAR seed points mid-grey instead of colored from the images")
+    print("         LIDAR_SURFACE=0 lets pixels where LiDAR measured a surface count as background again")
+    print("         MESH_OBJ=<path.obj> after training, builds the mesh as the app does after training: from the trained")
     print("           Gaussians' surface depth (from training's MVS depth with GEO_REG=0); MESH_VOXEL=<m> (default")
     print("           0.005) / MESH_TRUNC=<voxels> (default 4) / MESH_MIN_WEIGHT (default 3) /")
     print("           MESH_MIN_COMPONENT=<tris> (default 200) / MESH_MAX_VOXELS (default 12M)")
@@ -73,6 +78,12 @@ func usage() {
     print("    Open a window and render a .ply (or .splat/.spz) with MetalSplatter.")
     print("    Drag to orbit, scroll to zoom; close the window to quit.")
     print("    env: VIEWER_TRANSPARENCY=sorted|stochastic|movement (default movement = stochastic alpha only while interacting)")
+    print("")
+    print("  splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog}> [shDegree]")
+    print("    Convert a trained PLY to another splat format, picked by the output extension.")
+    print("    Keeps every SH band the PLY has unless [shDegree] (0-3) lowers it. SOG and GLB need")
+    print("    no viewer support here; the <base>.background.json sidecar is read and, for")
+    print("    PLY/SPZ/.splat, written. env: SOG_ITERATIONS=<n> (SH k-means, default 10)")
     print("")
     print("  splatelier train-view <colmap_scene_dir> [iterations] [maxDim] [maxPoints] [output.ply] [capMax] [init] [replayCache]")
     print("    Train with MCMC densification in a live window that updates as it")
@@ -355,6 +366,9 @@ case "train-capture":
             // POSE_DUMP=<path.json> writes poses before and after BA (for evaluating pose
             // accuracy).
             poseDumpURL: env["POSE_DUMP"].map { URL(fileURLWithPath: $0) },
+            // POSE_SOURCE=arkit: MVS and training use the ARKit poses instead of the BA poses
+            // (BA still runs, for the frame set and lens undistortion).
+            revertToARKitPoses: env["POSE_SOURCE"]?.lowercased() == "arkit",
             log: logErr)
         let result = try CaptureTraining.train(
             geometry: geometry,
@@ -380,6 +394,18 @@ case "train-capture":
             trainingViewCap: env["VIEW_CAP"].flatMap { Int($0) },
             maxInitGaussians: env["INIT_CAP"].flatMap { Int($0) }
                 ?? CaptureTraining.AppPreset.initialGaussianCap(cap: capMax),
+            // SEED_ALLOC=confidence: per cell keep MVS or LiDAR by mean confidence and cap per cell
+            // (SEED_CELL_PX=<pixels across>, default 16; SEED_LIDAR_WEIGHT=<w>, default 1).
+            seedAllocation: env["SEED_ALLOC"]?.lowercased() == "confidence"
+                ? .confidence(cellPixels: env["SEED_CELL_PX"].flatMap { Float($0) } ?? 16,
+                              lidarWeight: env["SEED_LIDAR_WEIGHT"].flatMap { Float($0) } ?? 1)
+                : .even,
+            // LIDAR_COLOR=0: leave the LiDAR seed points mid-grey (colored from the images as in the
+            // app).
+            lidarColors: env["LIDAR_COLOR"] != "0",
+            // LIDAR_SURFACE=0: pixels where LiDAR measured a surface may be background again (they
+            // are kept out of the background mask as in the app).
+            lidarSurfaceMask: env["LIDAR_SURFACE"] != "0",
             // C2F=<fraction>: share of iterations at 1/C2F_FACTOR of the captured resolution.
             // FINE_RES=<num>/<den> | full: resolution of the rest. The defaults are the app's (0.5,
             // 1/3 and 2/3: the coarse phase is half the fine resolution); with FINE_RES the coarse
@@ -432,7 +458,7 @@ case "train-capture":
                 training: split.training, heldOut: split.heldOut,
                 to: outputPLY.deletingPathExtension().appendingPathExtension("split.json"))
         }
-        // MESH_OBJ=<path.obj>: after training, build the mesh as the app's Generate mesh does
+        // MESH_OBJ=<path.obj>: after training, build the mesh as the app does
         // (MESH_* knobs in MeshCapture.swift).
         if let meshOBJ = env["MESH_OBJ"].map({ URL(fileURLWithPath: $0) }),
            !(try writeCaptureMesh(geometry: geometry, session: result.session,
@@ -738,6 +764,38 @@ case "stats":
         print("scale:    median \(median(scH))  mean \(mean(scH))  max \(scH.max() ?? 0)")
     } catch {
         print("stats failed: \(error)"); exit(1)
+    }
+
+case "convert":
+    guard args.count >= 4 else {
+        print("usage: splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog}> [shDegree]")
+        exit(1)
+    }
+    let inURL = URL(fileURLWithPath: args[2])
+    let outURL = URL(fileURLWithPath: args[3])
+    guard let format = SplatExportFormat(url: outURL) else {
+        print("convert: unknown output extension \(outURL.lastPathComponent)"); exit(1)
+    }
+    do {
+        let start = Date()
+        let joulesStart = gpuEnergyMeter?.joules()
+        var table = try SplatTable.readPLY(url: inURL)
+        if args.count > 4, let degree = Int(args[4]), (0...3).contains(degree) {
+            table = table.reducingSH(to: degree)
+        }
+        let iterations = ProcessInfo.processInfo.environment["SOG_ITERATIONS"].flatMap(Int.init) ?? 10
+        try SplatExporter.write(table, format: format, to: outURL,
+                                options: .init(shIterations: iterations, log: { print("  " + $0) }))
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int) ?? 0
+        print(String(format: "convert: %d splats (SH degree %d, background %d) → %@ %.1f MB in %.2fs",
+                     table.count, table.shDegree, table.backgroundCount, format.displayName,
+                     Double(bytes) / 1e6, Date().timeIntervalSince(start)))
+        if let j0 = joulesStart, let j1 = gpuEnergyMeter?.joules() {
+            print(String(format: "  GPU energy: %.1f J", j1 - j0))
+        }
+        print("wrote \(outURL.path)")
+    } catch {
+        print("convert failed: \(error)"); exit(1)
     }
 
 case "cull":

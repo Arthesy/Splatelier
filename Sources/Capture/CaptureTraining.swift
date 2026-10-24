@@ -48,7 +48,8 @@ public enum CaptureTraining {
     /// seed).
     public static func makeViews(
         frames: [CapturedFrame], tileSize: Int = 16, background: MLXArray,
-        weightByTimestamp: [TimeInterval: Float]? = nil
+        weightByTimestamp: [TimeInterval: Float]? = nil,
+        lidarSurfaceMask: Bool = false
     ) -> [TrainView] {
         var views: [TrainView] = []
         views.reserveCapacity(frames.count)
@@ -74,13 +75,53 @@ public enum CaptureTraining {
             // Keep images resident as uint8 (callers convert to float on demand; no caching).
             eval(camera.viewmat, camera.intrinsics, image)
             let weight = weightByTimestamp?[frame.timestamp] ?? 1.0
-            views.append(TrainView(
+            var view = TrainView(
                 camera: camera, image: image,
                 name: String(format: "capture_%06d.png", idx),
                 weight: weight
-            ))
+            )
+            if lidarSurfaceMask { view.surfaceMask = surfaceMask(frame) }
+            views.append(view)
         }
         return views
+    }
+
+    /// Cells of the surface mask across the image: the grid of the recorded LiDAR samples (every
+    /// 8th of the 256×192 depth pixels), so each sample marks its own cell.
+    static let surfaceMaskGrid = (rows: 24, cols: 32)
+
+    /// [rows, cols] grid with 1 in the cells the frame's LiDAR samples project to, nil without
+    /// samples. Samples only exist where the sensor returned a surface within range, so the cells
+    /// left 0 are where the background may show (sky, far walls, windows).
+    static func surfaceMask(_ frame: CapturedFrame) -> MLXArray? {
+        guard !frame.lidarSamples.isEmpty else { return nil }
+        let (rows, cols) = surfaceMaskGrid
+        var grid = [Float](repeating: 0, count: rows * cols)
+        let k = frame.intrinsics
+        for s in frame.lidarSamples {
+            let p = s.cameraPoint
+            guard p.z > 0 else { continue }
+            let u = (k.fx * p.x / p.z + k.cx) / Float(frame.width)
+            let v = (k.fy * p.y / p.z + k.cy) / Float(frame.height)
+            guard u >= 0, u < 1, v >= 0, v < 1 else { continue }
+            grid[Int(v * Float(rows)) * cols + Int(u * Float(cols))] = 1
+        }
+        return MLXArray(grid, [rows, cols])
+    }
+
+    /// Mean rendered foreground alpha over the pixels where LiDAR measured a surface: a wall
+    /// taken over by the background shows as alpha near 0 there although the image still matches.
+    static func logSurfaceAlpha(views: [TrainView], trainer: GaussianTrainer, label: String, log: (String) -> Void) {
+        var sum: Float = 0, count: Float = 0
+        for v in views {
+            guard let mask = v.surfaceMask else { continue }
+            let alpha = trainer.renderer.forward(model: trainer.model, camera: v.camera, shDegree: 3).renderAlpha
+            let m = GaussianTrainer.upsampleNearest(mask, height: v.camera.height, width: v.camera.width)
+            sum += (alpha.reshaped([v.camera.height, v.camera.width]) * m).sum().item(Float.self)
+            count += m.sum().item(Float.self)
+        }
+        guard count > 0 else { return }
+        log(String(format: "[eval-holdout] %@: mean foreground alpha on LiDAR surface pixels = %.3f", label, sum / count))
     }
 
     /// Trains an on-device capture from its geometry (`prepareGeometry`, shared with meshing;
@@ -116,6 +157,15 @@ public enum CaptureTraining {
         // all frames). 0 disables; nil is the app's `recommendedTrainingViewCap` for the capture.
         trainingViewCap: Int? = nil,
         maxInitGaussians: Int? = nil,
+        // How MVS and LiDAR share the initial Gaussians (`SeedAllocation`).
+        seedAllocation: SeedAllocation = .even,
+        // Color the LiDAR seed points from the frame images (mid-grey otherwise). Worth +0.8 to
+        // +1.3 dB held-out where LiDAR is a large share of the seed.
+        lidarColors: Bool = true,
+        // Keep the pixels where LiDAR measured a surface out of the bg-SH background mask, so a
+        // plain wall the background color can imitate stays foreground (+0.5 dB held-out on a
+        // LiDAR capture; MVS depth for the same purpose gained nothing).
+        lidarSurfaceMask: Bool = true,
         // The background is always bg-SH: an O(pixels) background that renders the foreground on
         // black and composites `render + (1-alpha)·bg(dir)`. It is baked into far-shell Gaussians
         // at export, which the viewer can hide. Degree 4 (25 bands) absorbs more of the
@@ -138,6 +188,7 @@ public enum CaptureTraining {
         // geometry's depth maps). nil disables it.
         geometryRegularization: GeometryRegularization? = AppPreset.geometryRegularization,
         onThermalThrottle: ((ThermalThrottleState) -> Void)? = nil,
+        onPreview: ((TrainingPreviewFrame) -> Void)? = nil,
         onSnapshot: ((GaussianModel, Int) -> Void)? = nil,
         log: (String) -> Void = { print($0) }
     ) throws -> TrainingDriver.Result {
@@ -175,6 +226,8 @@ public enum CaptureTraining {
                 syntheticSparseCount: syntheticSparseCount, seed: seed,
                 extraSeedClouds: mvsCloud.map { [$0] } ?? [],
                 fusionVoxelSize: fusionVoxelSize,
+                allocation: seedAllocation, maxPoints: maxInitGaussians,
+                lidarColors: lidarColors,
                 log: log
             )
             eval(positions, colors)
@@ -199,7 +252,7 @@ public enum CaptureTraining {
         // Built last so the view copies are not resident alongside the seed build.
         var views = makeViews(
             frames: trainingFrames, tileSize: tileSize, background: background,
-            weightByTimestamp: geometry.weightByTimestamp
+            weightByTimestamp: geometry.weightByTimestamp, lidarSurfaceMask: lidarSurfaceMask
         )
         phaseMs("makeViews(decode+upload \(trainingFrames.count) frames)")
         if geometryRegularization != nil {
@@ -238,14 +291,17 @@ public enum CaptureTraining {
             useEarlySH: true,
             geometryRegularization: geometryRegularization,
             onThermalThrottle: onThermalThrottle,
+            onPreview: onPreview,
             onSnapshot: onSnapshot, log: log
         )
         if !heldOutFrames.isEmpty, let trainer = result.session?.trainer {
-            let heldOutViews = makeViews(frames: heldOutFrames, tileSize: tileSize, background: background)
+            let heldOutViews = makeViews(frames: heldOutFrames, tileSize: tileSize, background: background,
+                                         lidarSurfaceMask: true)
             log("[eval-holdout] held-out views:")
             _ = try TrainingDriver.evaluate(views: heldOutViews, log: log) {
                 trainer.renderForEval(camera: $0.camera)
             }
+            logSurfaceAlpha(views: heldOutViews, trainer: trainer, label: "held-out views", log: log)
             log("[eval-holdout] training views:")
             _ = try TrainingDriver.evaluate(views: views, log: log) {
                 trainer.renderForEval(camera: $0.camera)

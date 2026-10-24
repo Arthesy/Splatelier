@@ -35,7 +35,8 @@ and compiled to Metal.
 - **Export**: standard 3DGS PLY files that common splat viewers can open, and a mesh (OBJ) generated
   from the trained scene. Files are available in the Files app.
 - **Mac tools**: retrain a capture from the app on a Mac, train and evaluate on COLMAP scenes, and
-  inspect PLY files from the command line.
+  inspect PLY files from the command line. `splatelier convert` turns a PLY into compressed PLY, SPZ,
+  .splat, glTF (GLB) or SOG.
 
 ## Requirements
 
@@ -66,11 +67,11 @@ and compiled to Metal.
 
 1. In the **Capture** tab, tap **Start capture** and walk slowly around the subject. Keep it in view
    and cover it from several heights.
-2. Tap **Stop**, then **Train this capture**. Choose the number of iterations and the Gaussian cap,
-   and tap **Start training**.
-3. When training finishes, tap **View** to open the result. From there you can **Train more**,
-   **Generate mesh** or **Export**. Trained models are listed in the **Library** tab and in the Files
-   app.
+2. Tap **Stop**. The same screen now shows the capture; choose the number of iterations and the
+   Gaussian cap, and tap **Start training**. Progress appears in place.
+3. When training finishes, a mesh is generated automatically and the result opens in the viewer.
+   From there you can **Share** the files, **Train more**, or tap **Hint** for the controls. Trained
+   models are listed in the **Library** tab and in the Files app.
 
 Tips: even lighting and a textured subject give the best results. Shiny, transparent and plain
 white surfaces are hard to reconstruct.
@@ -173,6 +174,14 @@ We referred to the code of these projects while writing our own:
 - [SuperSplat](https://github.com/playcanvas/supersplat) and the
   [PlayCanvas Engine](https://github.com/playcanvas/engine) (MIT): stochastic transparency in the
   viewer
+- [splat-transform](https://github.com/playcanvas/splat-transform) (MIT): the compressed PLY, SOG
+  and glTF (KHR_gaussian_splatting) export layouts, and the codebook quantization and Morton order
+  used by them
+
+The animations in the app (`scripts/media/`) are drawn with these fonts, all under the SIL Open Font
+License 1.1: [Instrument Serif](https://github.com/Instrument/instrument-serif),
+[Lora](https://github.com/cyrealtype/Lora-Cyrillic) and
+[Noto Sans JP](https://github.com/notofonts/noto-cjk).
 
 Main papers:
 
@@ -194,6 +203,7 @@ Main papers:
 | 3D Gaussian Splatting | Kerbl et al. 2023, ACM TOG 42(4) |
 | 3D Gaussian Splatting as MCMC | Kheradmand et al. 2024 |
 | EWA splatting (viewer's 2D covariance) | Zwicker et al. 2001, IEEE Visualization |
+| SteadySplats (viewer's temporal accumulation while moving) | Windisch et al. 2026, arXiv 2610.05576 |
 | PocketGS | arXiv 2601.17354 |
 | ImprovedGS+ | arXiv 2603.08661 |
 | Mobile3DRecon | Yang et al. 2020, ISMAR |
@@ -203,6 +213,8 @@ Main papers:
 | Census transform | Zabih & Woodfill 1994; Fife & Archibald 2013 |
 | Stereo confidence measures | Hu & Mordohai 2012 |
 | Bundle adjustment | Triggs et al. 2000; Solà et al. 2018 |
+| Square-root bundle adjustment (point elimination by QR) | Demmel et al. 2021, CVPR |
+| Shifted CholeskyQR | Fukaya et al. 2020, SIAM J. Sci. Comput. |
 | FAST, BRIEF, ORB | Rosten & Drummond 2006; Calonder et al. 2010; Rublee et al. 2011 |
 | Ratio test | Lowe 2004 |
 | Similarity transform alignment | Umeyama 1991 |

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Splatelier contributors
 //
-// The mesh of `train-capture` with MESH_OBJ, as the app's Generate mesh (OBJ, vertex colors): after
+// The mesh of `train-capture` with MESH_OBJ, as the app's automatic mesh (OBJ, vertex colors): after
 // training with the geometric regularization, the trained Gaussians' surface depth → TSDF fusion →
 // Marching Cubes; otherwise (GEO_REG=0, or `gs-mesh`) training's MVS depth.
 //

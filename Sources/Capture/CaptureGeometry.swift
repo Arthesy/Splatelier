@@ -179,6 +179,9 @@ extension CaptureTraining {
         // For pose accuracy evaluation: write post-BA (and pre-BA) viewmats / intrinsics /
         // timestamps as JSON.
         poseDumpURL: URL? = nil,
+        // For pose accuracy evaluation: after BA, put every frame back on its ARKit pose. The
+        // frame set and lens undistortion stay as BA left them, so only the poses differ.
+        revertToARKitPoses: Bool = false,
         log: (String) -> Void = { print($0) }
     ) -> CaptureGeometry {
         precondition(!scene.frames.isEmpty, "CapturedScene has no frames")
@@ -198,7 +201,7 @@ extension CaptureTraining {
             opticalFlowDiagnostics: opticalFlowDiagnostics, flowSoftWeight: flowSoftWeight, log: log)
         phaseMs("intake(outlier+quality+flow)")
 
-        let workingScene = refinePoses(
+        var workingScene = refinePoses(
             intake.scene, preBaScale: intake.preBaScale,
             orbFastThreshold: orbFastThreshold, orbMaxKeypointsPerFrame: orbMaxKeypointsPerFrame,
             // Add multi-view tracks from ARKit feature-point IDs to the BA observations
@@ -207,6 +210,14 @@ extension CaptureTraining {
         phaseMs("BA+geomrefine(ORB/match/loop/triangulate/BA/undistort)")
         if let poseDumpURL {
             writePoseDump(before: intake.scene, after: workingScene, to: poseDumpURL, log: log)
+        }
+        if revertToARKitPoses {
+            var arkitByTimestamp: [TimeInterval: [Float]] = [:]
+            for f in intake.scene.frames { arkitByTimestamp[f.timestamp] = f.viewmat }
+            workingScene = workingScene.withFrames(workingScene.frames.map { f in
+                f.withViewmat(arkitByTimestamp[f.timestamp] ?? f.viewmat)
+            })
+            log("pose source: ARKit (BA poses discarded; frame set and undistortion kept)")
         }
 
         // From here MVS reads each frame once (at 1/4 size) and training reads only its views.

@@ -35,10 +35,12 @@ extension CaptureTraining {
             let pos = cloud.positions.asArray(Float.self)
             let col = cloud.colors.asArray(Float.self)
             let conf = cloud.confidences.asArray(Float.self)
+            let depth = cloud.observedDepths.asArray(Float.self)
             let n = cloud.positions.shape[0]
             var keptP = [Float](); keptP.reserveCapacity(pos.count)
             var keptC = [Float](); keptC.reserveCapacity(col.count)
             var keptConf = [Float](); keptConf.reserveCapacity(conf.count)
+            var keptDepth = [Float](); keptDepth.reserveCapacity(depth.count)
             var dropped = 0
             for i in 0..<n {
                 let dx = pos[i * 3] - c.x, dy = pos[i * 3 + 1] - c.y, dz = pos[i * 3 + 2] - c.z
@@ -46,6 +48,7 @@ extension CaptureTraining {
                     keptP.append(pos[i * 3]); keptP.append(pos[i * 3 + 1]); keptP.append(pos[i * 3 + 2])
                     keptC.append(col[i * 3]); keptC.append(col[i * 3 + 1]); keptC.append(col[i * 3 + 2])
                     keptConf.append(conf[i])
+                    keptDepth.append(depth[i])
                 } else { dropped += 1 }
             }
             if dropped > 0 {
@@ -58,8 +61,9 @@ extension CaptureTraining {
             let p = MLXArray(keptP, [kept, 3])
             let cc = MLXArray(keptC, [kept, 3])
             let cf = MLXArray(keptConf, [kept])
-            eval(p, cc, cf)
-            return SeedCloud(label: cloud.label, positions: p, colors: cc, confidences: cf)
+            let cd = MLXArray(keptDepth, [kept])
+            eval(p, cc, cf, cd)
+            return SeedCloud(label: cloud.label, positions: p, colors: cc, confidences: cf, observedDepths: cd)
         }
     }
 
@@ -75,8 +79,9 @@ extension CaptureTraining {
         let t0 = Date()
         defer { log(String(format: "[timing] MVS(total) = %.2fs", Date().timeIntervalSince(t0))) }
         let constraint: [SIMD3<Float>]
-        if scene.lidarPoints.count >= 200 {
-            constraint = scene.lidarPoints
+        let lidar = scene.lidarWorldPoints
+        if lidar.count >= 200 {
+            constraint = lidar
             log("MVS depth-range source: LiDAR \(constraint.count)")
         } else {
             let (pts, label) = sparseDepthRangePoints(scene: scene)
@@ -120,7 +125,8 @@ extension CaptureTraining {
         var result: SeedCloud?
         if let mvs, mvs.positions.shape[0] > 0 {
             result = farClip(SeedCloud(
-                label: "MVS", positions: mvs.positions, colors: mvs.colors, confidences: mvs.confidences), log: log)
+                label: "MVS", positions: mvs.positions, colors: mvs.colors, confidences: mvs.confidences,
+                observedDepths: mvs.observedDepths), log: log)
         }
         log(memorySnapshot("post-mvs"))
         return result
@@ -151,7 +157,7 @@ extension CaptureTraining {
         return model
     }
 
-    /// Returns the seed fusing the capture's LiDAR points (mid-grey) with extraSeedClouds. If there
+    /// Returns the seed fusing the capture's LiDAR points (mid-grey unless `lidarColors`) with extraSeedClouds. If there
     /// are none, synthesizes a spherical random seed. Sparse (BA / ARKit triangulated) points stay
     /// out of the seed as outlier / floater sources; they still serve for poses and the MVS depth
     /// range.
@@ -160,15 +166,52 @@ extension CaptureTraining {
         syntheticSparseCount: Int, seed: UInt64,
         extraSeedClouds: [SeedCloud] = [],
         fusionVoxelSize: Float = seedFusionVoxelSize,
+        allocation: SeedAllocation = .even,
+        maxPoints: Int? = nil,
+        // Color the LiDAR points from the frame images (mid-grey otherwise).
+        lidarColors: Bool = true,
         log: (String) -> Void
     ) -> (positions: MLXArray, colors: MLXArray) {
         log("seed sparse source: excluded (the seed is MVS + LiDAR only)")
-        // LiDAR fusion confidence is a fixed heuristic: 1.0 (real sensor).
+        // Each LiDAR point's fusion confidence is its samples' (`LiDARSample.confidence`).
         var seedClouds: [SeedCloud] = []
-        if let lidar = pointSeedCloud(label: "lidar", points: scene.lidarPoints, confidence: 1.0) {
-            seedClouds.append(lidar)
+        let lidarSamples = scene.lidarWorldSamples(colors: lidarColors)
+        let lidarPoints = voxelAverage(lidarSamples, voxelSize: lidarVoxelSize)
+        if !lidarSamples.isEmpty {
+            log(String(format: "[seed] LiDAR samples %d → %d (averaged per %.0f mm voxel), mean confidence %.2f",
+                       lidarSamples.count, lidarPoints.count, lidarVoxelSize * 1000,
+                       lidarPoints.reduce(0) { $0 + $1.confidence } / Float(Swift.max(1, lidarPoints.count))))
         }
-        seedClouds += extraSeedClouds
+        var lidarCloud = HostCloud(
+            positions: lidarPoints.map(\.position),
+            colors: lidarPoints.map(\.color),
+            confidences: lidarPoints.map(\.confidence),
+            depths: lidarPoints.map(\.depth))
+        var others = extraSeedClouds
+        if case .confidence(let cellPixels, let lidarWeight) = allocation {
+            let cells = AdaptiveCells(frames: scene.frames, cellPixels: cellPixels)
+            let mvsIndex = others.firstIndex(where: { $0.label == "MVS" })
+            var mvs = mvsIndex.map { hostCloud(others[$0]) } ?? HostCloud()
+            if lidarCloud.count > 0, mvs.count > 0 {
+                let keep = selectSources(mvs: mvs, lidar: lidarCloud, cells: cells,
+                                         lidarWeight: lidarWeight, log: log)
+                mvs = mvs.subset(keep.mvsKeep)
+                lidarCloud = lidarCloud.subset(keep.lidarKeep)
+            }
+            // Cap before fusion: fusion only merges points, so the count stays within the cap.
+            if let maxPoints, mvs.count + lidarCloud.count > maxPoints {
+                let all = lidarCloud.appending(mvs)
+                let keep = capPerCell(all, cells: cells, budget: maxPoints)
+                let lidarCount = lidarCloud.count
+                lidarCloud = lidarCloud.subset(Array(keep[..<lidarCount]))
+                mvs = mvs.subset(Array(keep[lidarCount...]))
+                log("[seed alloc] cap per cell: \(all.count) → \(lidarCloud.count + mvs.count) points "
+                    + "(LiDAR \(lidarCloud.count), MVS \(mvs.count))")
+            }
+            if let i = mvsIndex { others[i] = seedCloud(label: "MVS", mvs) }
+        }
+        if lidarCloud.count > 0 { seedClouds.append(seedCloud(label: "lidar", lidarCloud)) }
+        seedClouds += others.filter { $0.count > 0 }
         if !seedClouds.isEmpty {
             return concatenateSeedClouds(seedClouds, voxelSize: fusionVoxelSize, log: log)
         }
@@ -177,6 +220,24 @@ extension CaptureTraining {
             frames: scene.frames, count: syntheticSparseCount,
             radius: sceneScale, seed: seed
         )
+    }
+
+    static func hostCloud(_ c: SeedCloud) -> HostCloud {
+        let p = c.positions.asArray(Float.self), col = c.colors.asArray(Float.self)
+        return HostCloud(
+            positions: Swift.stride(from: 0, to: p.count, by: 3).map { SIMD3(p[$0], p[$0 + 1], p[$0 + 2]) },
+            colors: Swift.stride(from: 0, to: col.count, by: 3).map { SIMD3(col[$0], col[$0 + 1], col[$0 + 2]) },
+            confidences: c.confidences.asArray(Float.self),
+            depths: c.observedDepths.asArray(Float.self))
+    }
+
+    static func seedCloud(label: String, _ c: HostCloud) -> SeedCloud {
+        SeedCloud(
+            label: label,
+            positions: MLXArray(c.positions.flatMap { [$0.x, $0.y, $0.z] }, [c.count, 3]),
+            colors: MLXArray(c.colors.flatMap { [$0.x, $0.y, $0.z] }, [c.count, 3]),
+            confidences: MLXArray(c.confidences, [c.count]),
+            observedDepths: MLXArray(c.depths, [c.count]))
     }
 
     /// Sparse points bounding the MVS depth range when there is no LiDAR. ARKit raw points include
@@ -190,37 +251,23 @@ extension CaptureTraining {
         return (scene.sparsePoints, "ARKit raw \(scene.sparsePoints.count)")
     }
 
+    /// Voxel the LiDAR samples are averaged over before fusion. Samples of one surface from many
+    /// frames scatter by the depth error (L1 about 2.5 cm on ARKitScenes, PromptDA Table 1), far
+    /// more than the fusion voxel matched to MVS (3 mm), so unaveraged they enter the seed as a
+    /// thick shell with one point per sample. The voxel also sets the spacing left on well-covered
+    /// surfaces, so it trades density for averaging: 5 mm keeps four times the points of 1 cm.
+    static let lidarVoxelSize: Float = 0.005
+
     struct SeedCloud {
         let label: String
         let positions: MLXArray
         let colors: MLXArray
         /// Weight for Operator G's confidence-weighted fusion (`SeedFusion.fuse`).
         let confidences: MLXArray
+        /// Depth (m) at which the frames saw each point (sets its pixel footprint).
+        let observedDepths: MLXArray
 
         var count: Int { positions.shape[0] }
-    }
-
-    static func pointSeedCloud(
-        label: String,
-        points: [SIMD3<Float>],
-        confidence: Float
-    ) -> SeedCloud? {
-        guard !points.isEmpty else { return nil }
-        var flat: [Float] = []
-        flat.reserveCapacity(points.count * 3)
-        for p in points {
-            flat += [p.x, p.y, p.z]
-        }
-        let positions = MLXArray(flat, [points.count, 3])
-        let colors = MLXArray(
-            [Float](repeating: 0.5, count: points.count * 3),
-            [points.count, 3]
-        )
-        let confidences = MLXArray(
-            [Float](repeating: confidence, count: points.count),
-            [points.count]
-        )
-        return SeedCloud(label: label, positions: positions, colors: colors, confidences: confidences)
     }
 
     /// Voxel size for PocketGS Operator G's confidence-weighted fusion. Large enough that Operator

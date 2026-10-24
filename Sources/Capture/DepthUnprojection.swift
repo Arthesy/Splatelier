@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Splatelier contributors
 //
-// Unprojects ARFrame.sceneDepth (LiDAR) into a point cloud in ARKit world coordinates. depthMap is
-// DepthFloat32 with distance along the optical axis (m, not ray length). confidence is
-// ARConfidenceLevel raw. The ARKit camera is +Y up / −Z forward, so P_cam = (x, −y, −z) (following
-// the WWDC20 ARKit 4 sample). Output is in the same ARKit world coordinates as sparsePoints (the
-// flip to OpenCV happens on the viewmat side).
+// Unprojects ARFrame.sceneDepth (LiDAR) into camera-space samples. depthMap is DepthFloat32 with
+// distance along the optical axis (m, not ray length). confidence is ARConfidenceLevel raw. Samples
+// are in OpenCV camera coordinates (+X right, +Y down, +Z forward), the same convention as the
+// viewmats, so they can be moved to world with the post-BA pose (ARKit camera = (x, −y, −z) of
+// these, following the WWDC20 ARKit 4 sample).
 
 #if canImport(ARKit) && os(iOS)
 
@@ -38,15 +38,37 @@ public enum DepthUnprojection {
         }
     }
 
-    /// Turns `ARFrame.sceneDepth` into points in ARKit world coordinates.
-    public static func unprojectToWorld(
+    /// One depth sample.
+    public struct Sample: Sendable {
+        /// OpenCV camera coordinates (m).
+        public let cameraPoint: SIMD3<Float>
+        /// Unit normal in OpenCV camera coordinates, facing the camera. From the neighboring samples
+        /// (`stride` px away); the view direction where a neighbor is missing or across a depth
+        /// edge.
+        public let normal: SIMD3<Float>
+        /// Pixel center in normalized image coordinates (0..1). The depth map has the field of view
+        /// of `capturedImage`, so this also indexes the color image.
+        public let uv: SIMD2<Float>
+        /// Size of one depth pixel on the surface facing the camera (depth / fx, m).
+        public let pixelSize: Float
+        /// ARConfidenceLevel raw value of the pixel (0=low / 1=medium / 2=high).
+        public let confidenceLevel: UInt8
+        /// Largest depth difference to the 8 adjacent depth pixels (m). Large at depth edges, where
+        /// a ToF pixel mixes the near and far surface (mixed pixel).
+        public let depthSpread: Float
+        /// Column and row in the depth map.
+        public let x: Int
+        public let y: Int
+    }
+
+    /// Turns `ARFrame.sceneDepth` into samples every `params.stride` px.
+    public static func unproject(
         depthMap: CVPixelBuffer,
         confidenceMap: CVPixelBuffer?,
         cameraIntrinsics: matrix_float3x3,
         imageResolution: CGSize,
-        cameraToWorld c2w: simd_float4x4,
         params: Params = .init()
-    ) -> [SIMD3<Float>] {
+    ) -> [Sample] {
         precondition(
             CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32,
             "ARKit depthMap format must be kCVPixelFormatType_DepthFloat32"
@@ -85,36 +107,46 @@ public enum DepthUnprojection {
             }
         }
 
-        let stride = Swift.max(1, params.stride)
-        let nCols = (depthW + stride - 1) / stride
-        let nRows = (depthH + stride - 1) / stride
-        var out: [SIMD3<Float>] = []
-        out.reserveCapacity(nCols * nRows)
+        func level(_ x: Int, _ y: Int) -> UInt8 { confBase.map { $0[y * confRowBytes + x] } ?? 2 }
+        /// Camera point of a valid pixel, nil if out of range or below the confidence threshold.
+        func point(_ x: Int, _ y: Int) -> SIMD3<Float>? {
+            guard x < depthW, y < depthH else { return nil }
+            let z = depthBase[y * depthRowFloats + x]
+            guard z >= params.minDepth, z <= params.maxDepth else { return nil }
+            if level(x, y) < params.minConfidenceRaw { return nil }
+            // pixel center +0.5
+            return SIMD3<Float>((Float(x) + 0.5 - K.cx) / K.fx * z, (Float(y) + 0.5 - K.cy) / K.fy * z, z)
+        }
 
-        var y = 0
-        while y < depthH {
-            var x = 0
-            while x < depthW {
-                let z = depthBase[y * depthRowFloats + x]
-                if z >= params.minDepth, z <= params.maxDepth {
-                    var keep = true
-                    if let cb = confBase {
-                        let c = cb[y * confRowBytes + x]
-                        if c < params.minConfidenceRaw { keep = false }
-                    }
-                    if keep {
-                        // pixel center +0.5
-                        let xp = (Float(x) + 0.5 - K.cx) / K.fx * z
-                        let yp = (Float(y) + 0.5 - K.cy) / K.fy * z
-                        // Image y points down and the ARKit camera is −Z forward, so negate y/z.
-                        let pCam = SIMD4<Float>(xp, -yp, -z, 1)
-                        let pWorld = c2w * pCam
-                        out.append(SIMD3<Float>(pWorld.x, pWorld.y, pWorld.z))
+        let stride = Swift.max(1, params.stride)
+        var out: [Sample] = []
+        out.reserveCapacity(((depthW + stride - 1) / stride) * ((depthH + stride - 1) / stride))
+        for y in Swift.stride(from: 0, to: depthH, by: stride) {
+            for x in Swift.stride(from: 0, to: depthW, by: stride) {
+                guard let p = point(x, y) else { continue }
+                let toCamera = -simd_normalize(p)
+                var normal = toCamera
+                // Neighbors more than 10% off in depth lie across an edge, not on this surface.
+                if let px = point(x + stride, y), let py = point(x, y + stride),
+                   abs(px.z - p.z) < 0.1 * p.z, abs(py.z - p.z) < 0.1 * p.z {
+                    let n = simd_cross(px - p, py - p)
+                    if simd_length(n) > 1e-12 {
+                        normal = simd_normalize(n)
+                        if simd_dot(normal, toCamera) < 0 { normal = -normal }
                     }
                 }
-                x += stride
+                var spread: Float = 0
+                for ny in Swift.max(0, y - 1)...Swift.min(depthH - 1, y + 1) {
+                    for nx in Swift.max(0, x - 1)...Swift.min(depthW - 1, x + 1) {
+                        let nz = depthBase[ny * depthRowFloats + nx]
+                        if nz > 0 { spread = Swift.max(spread, abs(nz - p.z)) }
+                    }
+                }
+                out.append(Sample(
+                    cameraPoint: p, normal: normal,
+                    uv: SIMD2((Float(x) + 0.5) / Float(depthW), (Float(y) + 0.5) / Float(depthH)),
+                    pixelSize: p.z / K.fx, confidenceLevel: level(x, y), depthSpread: spread, x: x, y: y))
             }
-            y += stride
         }
         return out
     }

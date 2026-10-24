@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Splatelier contributors
 //
-// Screen that trains a CapturedScene. Shows the settings card, progress, the log tail and
-// post-training actions.
+// The training part of the Capture screen: before training it shows what is being trained and the
+// settings; then progress and, when done, the way into the viewer. It lives inside
+// the Capture tab (no screen of its own); only the viewer is pushed on top.
 
 import SwiftUI
 import Trainer
@@ -22,15 +23,16 @@ private struct TrainingHelp: Identifiable {
 }
 
 struct TrainingView: View {
-    @StateObject private var vm: TrainingViewModel
+    @ObservedObject var vm: TrainingViewModel
+    /// What is being trained (the capture result or the stored dataset), shown above the settings
+    /// before training starts. Type-erased like the cards below (see decoratedScroll).
+    let header: AnyView
+    /// Leaves the training flow and goes back to the start screen.
+    let onClose: () -> Void
+    /// A fresh capture is not saved until it is trained, so closing before that discards it. A
+    /// stored dataset stays where it is, so closing is harmless.
+    let closeDiscards: Bool
     @State private var activeHelp: TrainingHelp?
-
-    init(scene: CapturedScene, resumeDatasetURL: URL? = nil, preserveDataset: Bool = false,
-         initialName: String = "") {
-        _vm = StateObject(wrappedValue: TrainingViewModel(
-            scene: scene, resumeDatasetURL: resumeDatasetURL, preserveDataset: preserveDataset,
-            initialName: initialName))
-    }
 
     /// Thermal banner. critical (thermalPaused) means paused, serious (thermalThrottled) means
     /// slowed down. critical takes display priority; the banner disappears once the device cools
@@ -71,21 +73,34 @@ struct TrainingView: View {
     }
 
     private var decoratedScroll: some View {
-        ScrollView {
+        Group {
             // Without type erasure via AnyView the generic metadata gets deep, and on device the
             // SubstGenericParametersFromMetadata recursion overflows the stack.
-            VStack(spacing: 16) {
-                AnyView(iterationCountStepper)
-                AnyView(gaussianCapCard)
-                if !isIdle { AnyView(phaseCard) }
-                if !isIdle { AnyView(metricsCard) }
-                if !vm.logTail.isEmpty { AnyView(logTailCard) }
+            if isIdle {
+                ScrollView {
+                    VStack(spacing: 16) {
+                        header
+                        AnyView(trainingSettingsCard)
+                        AnyView(startButton)
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 12)
+                    .padding(.bottom, 12)
+                }
+                .scrollIndicators(.hidden)
+            } else {
+                // What the model looks like now (it sharpens as it trains), then the progress and
+                // the measurements.
+                VStack(spacing: 16) {
+                    AnyView(previewCard).frame(maxHeight: .infinity)
+                    AnyView(phaseCard)
+                    AnyView(metricsCard)
+                }
+                .padding(.horizontal)
+                .padding(.top, 12)
+                .padding(.bottom, 12)
             }
-            .padding(.horizontal)
-            .padding(.top, 12)
-            .padding(.bottom, 12)
         }
-        .scrollIndicators(.hidden)
         .overlay(alignment: .top) { thermalPausedBanner }
         .animation(.easeInOut(duration: 0.25), value: vm.thermalPaused)
         .animation(.easeInOut(duration: 0.25), value: vm.thermalThrottled)
@@ -97,11 +112,6 @@ struct TrainingView: View {
                 .frame(maxWidth: .infinity)
                 .background(.ultraThinMaterial)
         }
-        .navigationTitle("Train")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(.visible, for: .navigationBar)
-        // Also disables the swipe back. See vm.isBusy.
-        .navigationBarBackButtonHidden(vm.isBusy)
         // Do not touch the parent TabView's tab bar. It triggers a known bug where the layout
         // change at training start jumps to the Library tab on its own (paired with RootView's
         // explicit selection).
@@ -116,44 +126,99 @@ struct TrainingView: View {
         // valset name.
         .alert("Name this capture", isPresented: $vm.showNamePrompt) {
             TextField("Name (optional)", text: $vm.captureName)
-            Button("Save") { vm.saveCaptureName() }
-            Button("Skip", role: .cancel) {}
+            Button("Set name") { vm.saveCaptureName() }
+            Button("Default name", role: .cancel) {}
         } message: {
-            Text("If left empty, the date and time name is kept. You can also rename it later in the Library.")
+            Text("The result is already saved. Name it now, or keep the date and time as its name. You can rename it any time in the viewer or the Library.")
+        }
+        .onChange(of: vm.showNamePrompt) { _, shown in
+            if !shown { vm.openViewerIfReady() }
+        }
+        // The viewer opens on its own once training and its mesh have finished.
+        .navigationDestination(item: $vm.viewerTarget) { target in
+            viewerScreen(target)
         }
     }
 
-    /// Measurement display compared against the PocketGS paper's targets (4 min / <3 GB peak).
-    private var metricsCard: some View {
-        HStack(spacing: 16) {
-            metricLabel(title: "Elapsed", value: formatElapsed(vm.elapsedSec),
-                        target: "≤ 4 min",
-                        isMet: vm.elapsedSec <= 240)
-            Divider()
-            metricLabel(title: "GPU peak", value: formatBytes(vm.peakMemoryBytes),
-                        target: "< 3 GB",
-                        isMet: vm.peakMemoryBytes < 3 * 1024 * 1024 * 1024)
-            Divider()
-            metricLabel(title: "GPU active", value: formatBytes(vm.activeMemoryBytes),
-                        target: nil, isMet: true)
+    /// Viewer for the trained capture, with sharing and "Train more" wired to this model. Naming
+    /// can also be done with its rename button.
+    private func viewerScreen(_ target: ViewerTarget) -> some View {
+        var shareItems = [SplatExportShare.item(for: target.plyURL)]
+        if let mesh = vm.meshOBJURL {
+            shareItems.append(SplatViewerShareItem(
+                title: "Mesh (OBJ)", systemImage: "triangle", url: mesh))
         }
-        .padding()
-        .cardBackground()
+        // The training log and the mesh log go out together as "Log".
+        let logs = [target.logURL, vm.meshLogURL].compactMap { $0 }
+        if !logs.isEmpty {
+            shareItems.append(SplatViewerShareItem(title: "Log", systemImage: "doc.text", urls: logs))
+        }
+        return SplatViewerScreen(
+            url: target.plyURL,
+            seedURL: vm.seedPLYURL,
+            meshURL: vm.meshOBJURL,
+            name: CaptureMetadataName.load(for: target.plyURL),
+            shareItems: shareItems,
+            onTrainMore: vm.canContinueTraining && !vm.isGeneratingMesh ? {
+                // Back to this screen's log, then continue; the viewer opens again when it ends.
+                vm.viewerTarget = nil
+                vm.continueTraining()
+            } : nil,
+            trainMoreMessage: "Trains \(TrainingViewModel.continueIterationCount) more iterations on this result, then rebuilds the mesh. It takes a minute or two, and the result is replaced.",
+            onRename: { newName in
+                vm.captureName = newName
+                vm.saveCaptureName()
+            }
+        )
     }
 
-    @ViewBuilder
-    private func metricLabel(title: String, value: String, target: String?, isMet: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
-            // Ternary inference between HierarchicalShapeStyle and Color fails, so make Color
-            // explicit.
-            Text(value).font(.body.monospacedDigit())
-                .foregroundStyle(isMet ? Color.primary : Color.red)
-            if let target {
-                Text(target).font(.caption2).foregroundStyle(.secondary)
+    /// The model as it is now, from one view of the capture. Before the first picture there is a
+    /// quiet placeholder, so the layout does not jump.
+    private var previewCard: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: DesignSystem.cardRadius, style: .continuous)
+                .fill(Color.black.opacity(0.35))
+            if let image = vm.previewImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: DesignSystem.cardRadius, style: .continuous))
+                    .id(vm.previewCount)
+                    .transition(.opacity)
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "sparkles").font(.title2)
+                    Text("The picture appears when training starts").font(.footnote)
+                }
+                .foregroundStyle(.secondary)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.easeInOut(duration: 0.5), value: vm.previewCount)
+        .accessibilityLabel("Preview of the model")
+    }
+
+    /// Time and GPU memory in one small line under the progress. The peak turns red above the 3 GB
+    /// the PocketGS paper aims under.
+    private var metricsCard: some View {
+        HStack(spacing: 12) {
+            metricItem("Elapsed", formatElapsed(vm.elapsedSec))
+            metricItem("GPU peak", formatBytes(vm.peakMemoryBytes),
+                       isMet: vm.peakMemoryBytes < 3 * 1024 * 1024 * 1024)
+            metricItem("GPU active", formatBytes(vm.activeMemoryBytes))
+        }
+        .font(.caption2.monospacedDigit())
+        .lineLimit(1)
+        .minimumScaleFactor(0.8)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func metricItem(_ title: String, _ value: String, isMet: Bool = true) -> some View {
+        HStack(spacing: 4) {
+            Text(title).foregroundStyle(.secondary)
+            // Ternary inference between HierarchicalShapeStyle and Color fails, so make Color
+            // explicit.
+            Text(value).foregroundStyle(isMet ? Color.primary : Color.red)
+        }
     }
 
     private func formatElapsed(_ sec: Double) -> String {
@@ -168,7 +233,20 @@ struct TrainingView: View {
         return String(format: "%.0f MB", mb)
     }
 
-    private var iterationCountStepper: some View {
+    /// Iterations and the Gaussian cap in one card.
+    private var trainingSettingsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Training settings").font(.headline)
+            iterationControls
+            Divider()
+            gaussianCapControls
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .cardBackground()
+    }
+
+    private var iterationControls: some View {
         VStack(alignment: .leading, spacing: 8) {
             Stepper(value: $vm.iterations, in: 50...5000, step: 50) {
                 HStack {
@@ -186,12 +264,10 @@ struct TrainingView: View {
                 presetButton(label: "High", value: 5000)
             }
         }
-        .padding()
-        .cardBackground()
     }
 
-    private var gaussianCapCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private var gaussianCapControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
             settingHeader("Gaussian cap", help: .cap)
             Picker("Gaussian cap", selection: $vm.gaussianCap) {
                 Text("100k").tag(100_000)
@@ -202,8 +278,18 @@ struct TrainingView: View {
             .pickerStyle(.segmented)
             .disabled(!isIdle)
         }
-        .padding()
-        .cardBackground()
+    }
+
+    /// Right under the settings, so the two read as one step.
+    private var startButton: some View {
+        Button(action: { vm.start() }) {
+            Label("Start training", systemImage: "play.fill")
+                .fontWeight(.semibold)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(Color.kikyoFill)
+        .controlSize(.large)
     }
 
     private func settingHeader(_ title: String, help: TrainingHelp) -> some View {
@@ -240,7 +326,7 @@ struct TrainingView: View {
             .disabled(!isIdle)
             .frame(maxWidth: .infinity)
         if vm.iterations == value {
-            button.buttonStyle(.borderedProminent)
+            button.buttonStyle(.borderedProminent).tint(Color.kikyoFill)
         } else {
             button.buttonStyle(.bordered)
         }
@@ -248,23 +334,28 @@ struct TrainingView: View {
 
     private var phaseCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            switch vm.phase {
-            case .idle:
-                EmptyView()
-            case .running(let iter, let loss):
-                Label("Training", systemImage: "hourglass")
+            if vm.isBusy {
+                // One bar for the preprocessing, the training and the mesh.
+                Label(vm.progressLabel.isEmpty ? "Working" : vm.progressLabel, systemImage: "hourglass")
                     .font(.headline).foregroundStyle(.orange)
-                ProgressView(value: Double(iter),
-                             total: Double(max(1, vm.runningTotalIterations)))
+                ProgressView(value: vm.overallProgress)
                 HStack {
-                    Text("iter").foregroundStyle(.secondary)
-                    Text("\(iter) / \(vm.runningTotalIterations)").font(.body.monospacedDigit())
+                    if !vm.progressDetail.isEmpty {
+                        Text(vm.progressDetail).font(.body.monospacedDigit())
+                    }
                     Spacer()
-                    if let loss {
+                    if case .running(_, let loss?) = vm.phase {
                         Text("loss \(String(format: "%.4f", loss))")
                             .font(.body.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
+                    Text("\(Int(vm.overallProgress * 100))%").font(.body.monospacedDigit())
                 }
+            } else { switch vm.phase {
+            case .idle:
+                EmptyView()
+            case .running:
+                EmptyView()
             case .completed(let url, _, let count, let finalLoss):
                 Label("Training complete", systemImage: "checkmark.seal.fill")
                     .font(.headline).foregroundStyle(.green)
@@ -282,160 +373,94 @@ struct TrainingView: View {
                 Label("Training failed", systemImage: "xmark.octagon.fill")
                     .font(.headline).foregroundStyle(.red)
                 Text(msg).font(.caption).foregroundStyle(.secondary)
-            }
+            } }
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
         .cardBackground()
     }
 
-    private var logTailCard: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(vm.logTail.enumerated()), id: \.offset) { idx, line in
-                        Text(line)
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                            .id(idx)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .onChange(of: vm.logTail.count) { _, _ in
-                if let last = vm.logTail.indices.last {
-                    withAnimation { proxy.scrollTo(last, anchor: .bottom) }
-                }
-            }
-        }
-        .frame(maxHeight: 180)
-        .padding(8)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-
     private var actionRow: some View {
-        HStack {
+        VStack(spacing: 8) {
             switch vm.phase {
             case .idle:
-                Button(action: { vm.start() }) {
-                    Label("Start training", systemImage: "play.fill")
+                // Start training sits under the settings; only the way out is down here.
+                closeButton
+            case .running:
+                ProgressView().frame(maxWidth: .infinity)
+            case .completed(let url, let logURL, _, _):
+                // Only View is left: sharing and "Train more" are in the viewer, and the mesh is
+                // generated automatically after training.
+                Button {
+                    vm.viewerTarget = ViewerTarget(plyURL: url, logURL: logURL)
+                } label: {
+                    Label("View", systemImage: "eye")
                         .fontWeight(.semibold)
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(Color.kikyoFill)
                 .controlSize(.large)
-            case .running:
-                ProgressView().frame(maxWidth: .infinity)
-            case .completed(let url, let logURL, _, _):
-                // Put View on the top row; secondary actions are at most 2 per row (with 3, "Train more"
-                // (continue training) gets cut off). The middle row is processing (continue
-                // training, mesh generation); the bottom row is sharing (Export, Log).
-                VStack(spacing: 8) {
-                    // Show the display name and rename too, same as when opened from Library.
-                    NavigationLink {
-                        SplatViewerScreen(
-                            url: url,
-                            seedURL: vm.seedPLYURL,
-                            meshURL: vm.meshOBJURL,
-                            name: CaptureMetadataName.load(for: url),
-                            onRename: { newName in
-                                vm.captureName = newName
-                                vm.saveCaptureName()
-                            }
-                        )
-                    } label: {
-                        Label("View", systemImage: "eye")
-                            .fontWeight(.semibold)
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    HStack(spacing: 8) {
-                        if vm.canContinueTraining {
-                            Button(action: { vm.continueTraining() }) {
-                                secondaryLabel("Train more", systemImage: "plus.circle")
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.large)
-                            .disabled(vm.isGeneratingMesh)
-                        }
-                        meshButton
-                    }
-                    HStack(spacing: 8) {
-                        // Share the generated mesh (OBJ) together with the GS PLY.
-                        ShareLink(items: [url] + (vm.meshOBJURL.map { [$0] } ?? [])) {
-                            secondaryLabel("Export", systemImage: "square.and.arrow.up")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.large)
-                        if let logURL {
-                            // With the mesh generation's log once there is one.
-                            ShareLink(items: [logURL] + (vm.meshLogURL.map { [$0] } ?? [])) {
-                                secondaryLabel("Log", systemImage: "doc.text")
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.large)
-                        }
-                    }
-                    meshCaption
-                }
+                .disabled(vm.isGeneratingMesh)
+                meshCaption
+                closeButton
             case .failed:
                 Button(action: { vm.start() }) {
                     Label("Retry", systemImage: "arrow.clockwise")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.large)
+                closeButton.padding(.top, 14)
             }
         }
     }
 
-    private func secondaryLabel(_ title: String, systemImage: String) -> some View {
-        Label(title, systemImage: systemImage)
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
-            .frame(maxWidth: .infinity)
-    }
-
-    /// Mesh generation (after training, from the trained Gaussians or its MVS). After generating,
-    /// hide the button; display is left to View's mesh layer and sharing to Export.
-    @ViewBuilder private var meshButton: some View {
-        switch vm.meshPhase {
-        case .idle, .failed:
-            Button(action: { vm.generateMesh() }) {
-                secondaryLabel("Generate mesh", systemImage: "cube")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .disabled(!vm.canGenerateMesh)
-        case .running:
-            Button(action: {}) {
-                HStack(spacing: 6) {
-                    ProgressView()
-                    Text("Generating")
+    /// Bottom center: discards the capture / closes the dataset before training or after a failure,
+    /// and starts over with a new capture once the result is saved.
+    private var closeButton: some View {
+        let finished: Bool = { if case .completed = vm.phase { return true }; return false }()
+        let title = finished ? "New capture" : (closeDiscards ? "Discard capture" : "Close")
+        let symbol = finished ? "camera.viewfinder" : (closeDiscards ? "trash" : "xmark")
+        let destructive = !finished && closeDiscards
+        return Group {
+            if destructive {
+                // Plain red text, set apart from Start training so the two are not mixed up.
+                Button(role: .destructive, action: onClose) {
+                    Label(title, systemImage: symbol)
+                        .font(.subheadline)
+                        .padding(.horizontal, 12).padding(.vertical, 8)
                 }
-                .lineLimit(1)
-                .frame(maxWidth: .infinity)
+                .buttonStyle(.plain)
+                .foregroundStyle(.red)
+            } else {
+                Button(action: onClose) {
+                    Label(title, systemImage: symbol)
+                        .padding(.horizontal, 8)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .disabled(true)
-        case .completed:
-            EmptyView()
         }
+        .disabled(vm.isBusy)
     }
 
-    /// Result of mesh generation (failure reason / notice that it was generated).
+    /// State of the automatic mesh generation (progress / failure reason / notice that it was
+    /// generated). Display is left to the viewer's mesh layer and sharing to its Share menu.
     @ViewBuilder private var meshCaption: some View {
         switch vm.meshPhase {
+        case .running:
+            // Shown by the progress bar instead.
+            EmptyView()
         case .failed(let message):
             Text("Mesh generation failed: \(message)")
                 .font(.caption).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .completed(_, _, let triangleCount):
-            Text("Mesh: \(triangleCount) triangles (View · Export to share)")
+            Text("Mesh: \(triangleCount) triangles (open View to see it or share it)")
                 .font(.caption).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        case .idle, .running:
+        case .idle:
             EmptyView()
         }
     }

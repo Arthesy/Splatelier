@@ -168,6 +168,12 @@ public enum CostVolumeMVS {
     public struct Output {
         public let positions: MLXArray   // [N, 3] float32, world coordinates
         public let colors: MLXArray      // [N, 3] float32 in [0, 1]
+        /// [N] float32 peak-ratio confidence (`DepthFilter`) of the pixels behind each point
+        /// (averaged over the dedup voxel).
+        public let confidences: MLXArray
+        /// [N] float32 depth (m) at which the frames behind each point saw it (averaged over the
+        /// dedup voxel). With the frame's focal length it gives the point's pixel footprint.
+        public let observedDepths: MLXArray
         /// Accepted pixel count per frame (for debugging).
         public let perFramePointCount: [Int]
     }
@@ -238,6 +244,7 @@ public enum CostVolumeMVS {
         // The consistency check needs every frame's depth map, so unproject only after all are
         // ready.
         var fusionDepths: [Int: [Float]] = [:]
+        var fusionConfidences: [Int: [Float]] = [:]
         var fusionDims: [Int: (w: Int, h: Int)] = [:]
         func emitDepthView(_ i: Int, _ depth: [Float]) {
             let shape = inputs.rgbImages[i].shape
@@ -294,7 +301,8 @@ public enum CostVolumeMVS {
             let depthHost = runMultiViewCostMVS(
                 targetIdx: targetIdx, refIndices: refIndices, depths: depths,
                 census: census, viewmats: inputs.viewmats,
-                intrinsics: inputs.intrinsics, parameters: parameters
+                intrinsics: inputs.intrinsics, parameters: parameters,
+                confidence: { fusionConfidences[targetIdx] = $0 }
             )
             depthFilterKept.append(depthHost.lazy.filter { $0 > 0 }.count)
 
@@ -312,6 +320,8 @@ public enum CostVolumeMVS {
 
         var positions = MLXArray.zeros([0, 3])
         var colors = MLXArray.zeros([0, 3])
+        var confidences = MLXArray.zeros([0])
+        var observedDepths = MLXArray.zeros([0])
         if !fusionDepths.isEmpty {
             let fp = parameters.fusionConsistency
             let tFuse = Date()
@@ -321,7 +331,10 @@ public enum CostVolumeMVS {
                 rgb: { inputs.rgbImages[$0] }, cameraCenters: cameraCenters,
                 selCenter: selCenter, selParams: selParams, covisibility: { covisibility[$0] },
                 fusion: fp,
-                filteredDepths: depthMaps != nil ? { emitDepthView($0, $1) } : nil
+                filteredDepths: depthMaps != nil ? { emitDepthView($0, $1) } : nil,
+                pixelConfidences: fusionConfidences,
+                pointConfidences: { confidences = MLXArray($0) },
+                pointDepths: { observedDepths = MLXArray($0) }
             )
             if profiling { profile["fusionConsistency(CPU)", default: 0] += Date().timeIntervalSince(tFuse) }
             log(String(format:
@@ -331,7 +344,7 @@ public enum CostVolumeMVS {
             if kept > 0 {
                 positions = fpos
                 colors = fcol
-                eval(positions, colors)
+                eval(positions, colors, confidences, observedDepths)
             }
         }
         let preDedupCount = positions.shape[0]
@@ -349,19 +362,22 @@ public enum CostVolumeMVS {
         {
             let tDedup = Date()
             defer { if profiling { profile["voxelDedup(CPU)", default: 0] += Date().timeIntervalSince(tDedup) } }
-            let (fusedPos, fusedCol) = voxelDedup(
-                positions: positions, colors: colors, voxelSize: voxelSize
+            let (fusedPos, fusedCol, fusedAttr) = voxelDedup(
+                positions: positions, colors: colors, attributes: [confidences, observedDepths],
+                voxelSize: voxelSize
             )
-            eval(fusedPos, fusedCol)
+            eval([fusedPos, fusedCol] + fusedAttr)
             let postDedup = fusedPos.shape[0]
             let compress = preDedupCount > 0 ? Double(preDedupCount) / Double(postDedup) : 0
             log(String(
                 format: "[MVS diag] postDedup=%d (compression=%.2fx, voxelSize=%.3fm)",
                 postDedup, compress, voxelSize
             ))
-            return Output(positions: fusedPos, colors: fusedCol, perFramePointCount: perFrameCount)
+            return Output(positions: fusedPos, colors: fusedCol, confidences: fusedAttr[0],
+                          observedDepths: fusedAttr[1], perFramePointCount: perFrameCount)
         }
-        return Output(positions: positions, colors: colors, perFramePointCount: perFrameCount)
+        return Output(positions: positions, colors: colors, confidences: confidences,
+                      observedDepths: observedDepths, perFramePointCount: perFrameCount)
     }
 
     /// Gaze point and parameters for reference selection. The median depth z of the sparse points
@@ -415,13 +431,25 @@ public enum CostVolumeMVS {
     static func voxelDedup(
         positions: MLXArray, colors: MLXArray, voxelSize: Float
     ) -> (positions: MLXArray, colors: MLXArray) {
+        let (p, c, _) = voxelDedup(positions: positions, colors: colors, attributes: [], voxelSize: voxelSize)
+        return (p, c)
+    }
+
+    /// Averages position, color and each per-point attribute ([N] each) per voxel into one point
+    /// (CPU).
+    static func voxelDedup(
+        positions: MLXArray, colors: MLXArray, attributes: [MLXArray], voxelSize: Float
+    ) -> (positions: MLXArray, colors: MLXArray, attributes: [MLXArray]) {
         let n = positions.shape[0]
         let pos = positions.asArray(Float.self)
         let col = colors.asArray(Float.self)
+        let attr = attributes.map { $0.size == n ? $0.asArray(Float.self) : [Float](repeating: 0, count: n) }
+        let na = attr.count
         // Pack voxel indices into an Int64 key, 21 bits each with a bias.
         let bias: Int64 = 1 << 20    // supports ±2^20 voxels (= ±~10 km @ 1 cm)
         var sums: [Int64: (px: Double, py: Double, pz: Double,
-                            cr: Double, cg: Double, cb: Double, count: Int)] = [:]
+                            cr: Double, cg: Double, cb: Double, count: Int, slot: Int)] = [:]
+        var attrSums: [Double] = []
         sums.reserveCapacity(n / 4)
         let invSize = 1.0 / voxelSize
         for i in 0..<n {
@@ -434,29 +462,35 @@ public enum CostVolumeMVS {
             let vz = Int64((z * invSize).rounded(.down))
             if abs(vx) >= bias || abs(vy) >= bias || abs(vz) >= bias { continue }
             let key = ((vx + bias) << 42) | ((vy + bias) << 21) | (vz + bias)
-            var entry = sums[key] ?? (0, 0, 0, 0, 0, 0, 0)
+            var entry = sums[key] ?? (0, 0, 0, 0, 0, 0, 0, sums.count)
+            if entry.count == 0 { attrSums += [Double](repeating: 0, count: na) }
             entry.px += Double(x); entry.py += Double(y); entry.pz += Double(z)
             entry.cr += Double(col[i * 3 + 0]); entry.cg += Double(col[i * 3 + 1])
             entry.cb += Double(col[i * 3 + 2])
+            for a in 0..<na { attrSums[entry.slot * na + a] += Double(attr[a][i]) }
             entry.count += 1
             sums[key] = entry
         }
         var outPos: [Float] = []
         var outCol: [Float] = []
+        var outAttr = [[Float]](repeating: [], count: na)
         outPos.reserveCapacity(sums.count * 3)
         outCol.reserveCapacity(sums.count * 3)
         for (_, e) in sums {
             let inv = 1.0 / Double(e.count)
             outPos += [Float(e.px * inv), Float(e.py * inv), Float(e.pz * inv)]
             outCol += [Float(e.cr * inv), Float(e.cg * inv), Float(e.cb * inv)]
+            for a in 0..<na { outAttr[a].append(Float(attrSums[e.slot * na + a] * inv)) }
         }
         let m = sums.count
         if m == 0 {
-            return (positions: MLXArray.zeros([0, 3]), colors: MLXArray.zeros([0, 3]))
+            return (positions: MLXArray.zeros([0, 3]), colors: MLXArray.zeros([0, 3]),
+                    attributes: attributes.map { _ in MLXArray.zeros([0]) })
         }
         return (
             positions: MLXArray(outPos, [m, 3]),
-            colors: MLXArray(outCol, [m, 3])
+            colors: MLXArray(outCol, [m, 3]),
+            attributes: outAttr.map { MLXArray($0, [m]) }
         )
     }
 
@@ -499,7 +533,8 @@ public enum CostVolumeMVS {
         census: (Int) -> MLXArray,
         viewmats: [[Float]],
         intrinsics: [Intrinsics],
-        parameters: Parameters
+        parameters: Parameters,
+        confidence: (([Float]) -> Void)? = nil
     ) -> [Float] {
         guard !refIndices.isEmpty else { return [] }
         let targetCensus = timed("census") { () -> MLXArray in
@@ -555,6 +590,7 @@ public enum CostVolumeMVS {
                 threshold: parameters.confidenceThreshold,
                 excludeRadius: parameters.secondMinExcludeRadius
             )
+            confidence?(filt.confidence.asArray(Float.self))
             return filt.depthMap.asArray(Float.self)
         }
     }
@@ -577,12 +613,20 @@ public enum CostVolumeMVS {
         covisibility: (Int) -> [Float]? = { _ in nil },
         fusion: FusionConsistency, targets: [Int]? = nil,
         filteredDepths: ((Int, [Float]) -> Void)? = nil,
-        emitPoints: Bool = true
+        emitPoints: Bool = true,
+        // Per-frame per-pixel values (e.g. the depth filter's confidence); `pointConfidences`
+        // receives the value of each emitted point's pixel, in point order.
+        pixelConfidences: [Int: [Float]]? = nil,
+        pointConfidences: (([Float]) -> Void)? = nil,
+        // Receives each emitted point's accepted depth in its frame, in point order.
+        pointDepths: (([Float]) -> Void)? = nil
     ) -> (positions: MLXArray, colors: MLXArray, kept: Int, total: Int) {
         let frames = (targets ?? depths.keys.sorted()).filter { dims[$0] != nil && depths[$0] != nil }
         let k = fusion.neighborCount
         var keptPos: [Float] = []
         var keptCol: [Float] = []
+        var keptConf: [Float] = []
+        var keptDepth: [Float] = []
         var total = 0
         var accepted = 0
         for start in stride(from: 0, to: frames.count, by: fusionTargetsPerDispatch) {
@@ -643,6 +687,7 @@ public enum CostVolumeMVS {
                 let intr = intrinsics[i]
                 let vm = viewmats[i]
                 let rgbHost = emitPoints ? rgb(i).asArray(Float.self) : []   // [h*w*3] row-major
+                let confHost = pointConfidences != nil ? pixelConfidences?[i] : nil
                 var filtered = filteredDepths != nil ? [Float](repeating: -1, count: w * h) : []
                 for pix in 0..<(w * h) {
                     if dHost[pix] > 0 { total += 1 }
@@ -661,11 +706,15 @@ public enum CostVolumeMVS {
                     keptCol.append(rgbHost[pix * 3])
                     keptCol.append(rgbHost[pix * 3 + 1])
                     keptCol.append(rgbHost[pix * 3 + 2])
+                    if pointConfidences != nil { keptConf.append(confHost?[pix] ?? 0) }
+                    if pointDepths != nil { keptDepth.append(z) }
                 }
                 filteredDepths?(i, filtered)
                 offset += w * h
             }
         }
+        pointConfidences?(keptConf)
+        pointDepths?(keptDepth)
         let kept = keptPos.count / 3
         if kept == 0 {
             return (MLXArray.zeros([0, 3]), MLXArray.zeros([0, 3]), accepted, total)

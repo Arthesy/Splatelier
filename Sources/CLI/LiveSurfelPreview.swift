@@ -46,6 +46,11 @@
 //                        points (BA camera, undistorted image), both added in capture order.
 //                        SURFEL_POINT_SIGMA=<m> draws every point that size instead of the size of
 //                        the pixel that saw it
+//   SURFEL_LIDAR=1       add the LiDAR layer (LiveLiDARSurfels) from the valset's recorded samples
+//                        (every 8th depth pixel, so coarser than the app's every 4th; normals face
+//                        the camera). Rows become a 2×2 block: camera image | MVS layer only /
+//                        MVS + every LiDAR surfel | MVS + the LiDAR surfels the app shows
+//                        (SURFEL_LIDAR_STRIDE=<px>: splat footprint in depth pixels, default 4)
 
 import Foundation
 import MLX
@@ -81,6 +86,11 @@ func runSurfelPreviewReplay(
     let framesDir = outDir.appendingPathComponent("frames")
     if videoEvery > 0 { try FileManager.default.createDirectory(at: framesDir, withIntermediateDirectories: true) }
 
+    let withLiDAR = env["SURFEL_LIDAR"] == "1"
+    // Splat footprint in depth pixels: the app's live stride (4) by default, so the splats have the
+    // app's size although the recorded samples are every 8th pixel.
+    let lidarFootprintStride = f("SURFEL_LIDAR_STRIDE", 4)
+    var lidarMap = CaptureSurfelMap()
     let livePoints = PointCloudAccumulator(), finalPoints = PointCloudAccumulator()
     var finalFrame: CapturedFrame?
 
@@ -161,6 +171,16 @@ func runSurfelPreviewReplay(
             offset += n
         }
         points += offset
+        if withLiDAR, !frames[k].lidarSamples.isEmpty {
+            // As the app's live layer: ARKit pose, image color, footprint = depth pixel × stride.
+            let f = frames[k]
+            let center = FrameSubsampler.cameraCenter(viewmat: f.viewmat)
+            let depthPixelAngle = Float(f.width) / (f.intrinsics.fx * 256)
+            for s in CapturedScene(frames: [f], sparsePoints: []).lidarWorldSamples(colors: true) {
+                lidarMap.insert(position: s.position, normal: simd_normalize(center - s.position), color: s.color,
+                                pixelSize: s.depth * depthPixelAngle * lidarFootprintStride, cameraCenter: center, frame: k)
+            }
+        }
         insertSeconds += Date().timeIntervalSince(t1)
         if let finalMVS {
             livePoints.append(PointBatch(
@@ -186,6 +206,20 @@ func runSurfelPreviewReplay(
         let overlay = now + washed
         var row = MLX.concatenated(
             [camCrop, overlay, fixed[0..<h, 0..<w]], axis: 1)
+        if withLiDAR {
+            let lidarAll = lidarMap.snapshot()
+            let lidarShown = LiveLiDARSurfels.shown(lidarAll, minViews: 3, mvs: surfels, coverCell: 0.03)
+                .map { LiveLiDARSurfels.desaturated($0, keep: 0.5) }
+            func overlayOf(_ s: [CaptureSurfelMap.Surfel]) -> MLXArray {
+                let (rgb, alpha) = render(surfelModel(s, sigma: sigma, flat: flat), k)
+                return rgb[0..<h, 0..<w]
+                    + (1 - alpha[0..<h, 0..<w].expandedDimensions(axis: 2)) * ((1 - wash) * camCrop + wash)
+            }
+            row = MLX.concatenated([
+                MLX.concatenated([camCrop, overlay], axis: 1),
+                MLX.concatenated([overlayOf(surfels + lidarAll), overlayOf(surfels + lidarShown)], axis: 1),
+            ], axis: 0)
+        }
         if finalMVS != nil {
             func pointPanel(_ model: GaussianModel?, _ camera: Camera, _ image: MLXArray) -> MLXArray {
                 let bg = (1 - wash) * StreamingMVS.boxDownscale(image, factor: r)[0..<h, 0..<w] + wash

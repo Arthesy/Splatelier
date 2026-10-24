@@ -4,7 +4,8 @@
 // Iterative Geometric Refinement (PocketGS Operator G 3c, end of Sec. III-A 2). 1 round = BA
 // (`baIterationsPerRound` steps) → drop observations behind the camera → re-triangulate with GPU
 // DLT → drop observations with reprojection error > τ_repro → drop points with max triangulation
-// angle < τ_angle. Stops when nothing is removed or at `maxRounds`.
+// angle < τ_angle. Stops when nothing is removed or at `maxRounds`. The state's radial distortion
+// is used throughout (and estimated by BA when `baParameters.estimateDistortion`).
 
 import Foundation
 import simd
@@ -96,14 +97,17 @@ public enum IterativeGeometricRefinement {
             observations = filterBehindCamera(state: state, observations: observations)
             let droppedBehind = beforeBehind - observations.count
 
-            // Points with fewer than 2 observations keep their original position.
+            // Points with fewer than 2 observations keep their original position. DLT is pinhole,
+            // so it gets the observations with the current distortion removed.
             let triangulated = retriangulate(
-                state: state, intrinsics: intrinsics, observations: observations
+                state: state, intrinsics: intrinsics,
+                observations: undistorted(observations, state.distortion, intrinsics)
             )
 
             let beforeRepro = observations.count
             let filteredObs = filterReprojection(
-                state: BundleAdjustment.State(viewmats: state.viewmats, points: triangulated),
+                state: BundleAdjustment.State(viewmats: state.viewmats, points: triangulated,
+                                              distortion: state.distortion),
                 intrinsics: intrinsics,
                 observations: observations,
                 thresholdPx: parameters.reprojectionThresholdPx
@@ -120,7 +124,8 @@ public enum IterativeGeometricRefinement {
             let afterAngle = (observations.map { $0.pointIndex }).reduce(into: Set<Int>()) { $0.insert($1) }.count
             let droppedAngle = beforeAngle - afterAngle
 
-            state = BundleAdjustment.State(viewmats: state.viewmats, points: triangulated)
+            state = BundleAdjustment.State(viewmats: state.viewmats, points: triangulated,
+                                           distortion: state.distortion)
 
             let activePoints = Set(observations.map { $0.pointIndex }).count
             log(String(format:
@@ -145,6 +150,18 @@ public enum IterativeGeometricRefinement {
     }
 
     // MARK: - Internal helpers
+
+    /// Observations with `distortion` removed (pinhole pixels with the same intrinsics). An
+    /// observation whose inverse does not converge keeps its pixel.
+    static func undistorted(
+        _ observations: [BundleAdjustment.Observation], _ distortion: RadialDistortion, _ intrinsics: [Intrinsics]
+    ) -> [BundleAdjustment.Observation] {
+        guard !distortion.isNone else { return observations }
+        return observations.map { o in
+            guard let p = distortion.undistortPixel(o.pixel, intrinsics[o.cameraIndex]) else { return o }
+            return BundleAdjustment.Observation(cameraIndex: o.cameraIndex, pointIndex: o.pointIndex, pixel: p)
+        }
+    }
 
     /// Drops observations whose point is behind the camera (z ≤ 1e-3).
     static func filterBehindCamera(

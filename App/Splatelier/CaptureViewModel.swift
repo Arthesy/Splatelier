@@ -18,10 +18,6 @@ final class CaptureViewModel: ObservableObject {
     @Published private(set) var errorMessage: String?
     /// Number of world feature points accumulated for the live overlay.
     @Published private(set) var pointCount: Int = 0
-    /// LiDAR sceneDepth intake. It also decides the live point cloud (ON = LiDAR depth / OFF =
-    /// incremental MVS during capture). The LiDAR route is still experimental, so it is not exposed
-    /// in the UI and stays off.
-    private let enableLiDARDepth = false
     @Published private(set) var validationSaveState: ValidationSaveState = .idle
     /// Seconds since capture started (updated by the polling timer while running).
     @Published private(set) var captureElapsedSec: Int = 0
@@ -58,15 +54,15 @@ final class CaptureViewModel: ObservableObject {
 
     // MARK: - Actions
 
-    func start() {
+    /// - Parameter useLiDAR: record LiDAR depth with each frame and draw it over the MVS surfels.
+    ///   Ignored on devices without LiDAR.
+    func start(useLiDAR: Bool) {
         guard state != .running else { return }
         capturedScene = nil
         errorMessage = nil
         var cfg = baseConfiguration
-        // Devices without LiDAR cannot capture depth, so treat it as OFF (= MVS live point cloud).
-        let useLiDAR = enableLiDARDepth && ARKitCaptureSession.isLiDARAvailable
-        cfg.enableLiDARDepth = useLiDAR
-        cfg.liveReconstructionMode = useLiDAR ? .lidar : .mvs
+        cfg.enableLiDARDepth = useLiDAR && ARKitCaptureSession.isLiDARAvailable
+        cfg.liveReconstructionMode = .mvs
         // Quality selection during capture (drop blurred / badly exposed frames before saving) is
         // always ON.
         cfg.enableRealtimeQualityGate = true

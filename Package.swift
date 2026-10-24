@@ -37,6 +37,9 @@ let package = Package(
         // Vendored v1.0.1 with a patch that blends in sRGB space on non-sRGB targets
         // (matches training compositing); see Vendor/MetalSplatter/VENDORED.md.
         .package(path: "Vendor/MetalSplatter"),
+        // SPZ (Niantic's compressed splat format) packer, pure Swift (MIT). Already pulled in by
+        // MetalSplatter's SplatIO; the training library uses it directly for SPZ export.
+        .package(url: "https://github.com/scier/spz-swift.git", from: "2.1.0"),
     ],
     targets: [
         .target(
@@ -48,9 +51,15 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "spz", package: "spz-swift"),
             ],
             resources: [
                 .copy("Resources/Slang"),
+            ],
+            swiftSettings: [
+                // Accelerate's current LAPACK interface. The legacy CLAPACK entry points
+                // (`sposv_` without it) overrun the heap in BA's dense solve on macOS 27.
+                .unsafeFlags(["-Xcc", "-DACCELERATE_NEW_LAPACK"]),
             ]
         ),
         .executableTarget(
@@ -89,7 +98,8 @@ let package = Package(
         ),
         .testTarget(
             name: "TrainerTests",
-            dependencies: ["Trainer"]
+            dependencies: ["Trainer"],
+            swiftSettings: [.unsafeFlags(["-Xcc", "-DACCELERATE_NEW_LAPACK"])]
         ),
         .testTarget(
             name: "CaptureTests",

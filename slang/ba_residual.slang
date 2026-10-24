@@ -2,7 +2,8 @@
 // Copyright 2026 Splatelier contributors
 //
 // Writes per-observation reprojection residuals (pred - obs) and camera-space z (for the BA in
-// PocketGS Sec. III-A 2).
+// PocketGS Sec. III-A 2). The projection includes the radial distortion shared by all cameras
+// (normalized coordinates, f = 1 + k1 r² + k2 r⁴; see ba_linearize.slang).
 
 StructuredBuffer<float> viewmats;        // [num_cameras * 16] row-major world→camera
 StructuredBuffer<float> intrinsics_buf;  // [num_cameras * 4] (fx, fy, cx, cy)
@@ -10,6 +11,7 @@ StructuredBuffer<float> points;          // [num_points * 3]
 StructuredBuffer<int>   obs_cam_idx;     // [num_obs]
 StructuredBuffer<int>   obs_pt_idx;      // [num_obs]
 StructuredBuffer<float> obs_pixels;      // [num_obs * 2] (u, v)
+StructuredBuffer<float> res_params;      // [2] k1, k2
 StructuredBuffer<int>   res_dims;        // [1] num_obs
 
 RWStructuredBuffer<float> residuals;     // [num_obs * 2], 0 if zc <= 1e-3
@@ -51,8 +53,12 @@ void ba_residual(uint3 tid : SV_DispatchThreadID)
     }
 
     float invZ = 1.0 / zc;
-    float predU = fx * xc * invZ + cx;
-    float predV = fy * yc * invZ + cy;
+    float nx = xc * invZ;
+    float ny = yc * invZ;
+    float r2 = nx * nx + ny * ny;
+    float f = 1.0 + res_params[0] * r2 + res_params[1] * r2 * r2;
+    float predU = fx * f * nx + cx;
+    float predV = fy * f * ny + cy;
     residuals[i * 2 + 0] = predU - obs_pixels[i * 2 + 0];
     residuals[i * 2 + 1] = predV - obs_pixels[i * 2 + 1];
 }

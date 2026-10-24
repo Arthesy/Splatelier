@@ -238,16 +238,19 @@ extension BundleAdjustment {
                     e0 += lin[b + y] * Double(deltaCam[dc + y])
                     e1 += lin[b + 6 + y] * Double(deltaCam[dc + y])
                 }
-                v += SIMD3(lin[b + 12], lin[b + 13], lin[b + 14]) * e0 + SIMD3(lin[b + 15], lin[b + 16], lin[b + 17]) * e1
+                let p0 = SIMD3<Double>(lin[b + 12], lin[b + 13], lin[b + 14])
+                let p1 = SIMD3<Double>(lin[b + 15], lin[b + 16], lin[b + 17])
+                v += p0 * e0
+                v += p1 * e1
             }
             let sm = simd_double3x3(rows: [SIMD3(pdata[o], pdata[o + 1], pdata[o + 2]),
                                            SIMD3(pdata[o + 3], pdata[o + 4], pdata[o + 5]),
                                            SIMD3(pdata[o + 6], pdata[o + 7], pdata[o + 8])])
             let dk = SIMD2<Double>(deltaK)
-            let h = SIMD3(pdata[o + 9], pdata[o + 10], pdata[o + 11]) + sm.transpose * v
-                + SIMD3(pdata[o + 12] * dk.x + pdata[o + 13] * dk.y,
-                        pdata[o + 14] * dk.x + pdata[o + 15] * dk.y,
-                        pdata[o + 16] * dk.x + pdata[o + 17] * dk.y)
+            let q = SIMD3<Double>(pdata[o + 9], pdata[o + 10], pdata[o + 11])
+            let ck0 = SIMD3<Double>(pdata[o + 12], pdata[o + 14], pdata[o + 16])
+            let ck1 = SIMD3<Double>(pdata[o + 13], pdata[o + 15], pdata[o + 17])
+            let h = q + sm.transpose * v + ck0 * dk.x + ck1 * dk.y
             let dp = -(sm * h)
             out[j * 3] = Float(dp.x); out[j * 3 + 1] = Float(dp.y); out[j * 3 + 2] = Float(dp.z)
         }

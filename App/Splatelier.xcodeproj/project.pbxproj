@@ -47,7 +47,7 @@
 		381CC46EA36AC4A9AF165BEC /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		44D60E52950B5F46D58C659D /* Splatelier.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Splatelier.entitlements; sourceTree = "<group>"; };
 		4F5BA88DADD619751FBB57AD /* guide_pivot.mp4 */ = {isa = PBXFileReference; path = guide_pivot.mp4; sourceTree = "<group>"; };
-		5255952A58A7D197B00C4F61 /* spl-share */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "spl-share"; path = ..; sourceTree = SOURCE_ROOT; };
+		5255952A58A7D197B00C4F61 /* splatelier */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "splatelier"; path = ..; sourceTree = SOURCE_ROOT; };
 		6415796D99C0BA08F2A7C122 /* CaptureViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureViewModel.swift; sourceTree = "<group>"; };
 		69CEB026472D66F4CCE4E52B /* guide_loop.mp4 */ = {isa = PBXFileReference; path = guide_loop.mp4; sourceTree = "<group>"; };
 		77FA9D3F3D85A13D7BE47554 /* guide_light.mp4 */ = {isa = PBXFileReference; path = guide_light.mp4; sourceTree = "<group>"; };
@@ -130,7 +130,7 @@
 		AEFA5A2F95EBA9F696C42B6E /* Packages */ = {
 			isa = PBXGroup;
 			children = (
-				5255952A58A7D197B00C4F61 /* spl-share */,
+				5255952A58A7D197B00C4F61 /* splatelier */,
 			);
 			name = Packages;
 			sourceTree = "<group>";

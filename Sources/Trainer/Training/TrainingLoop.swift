@@ -42,6 +42,8 @@ extension TrainingDriver {
         // `startFraction` of the iterations on. nil disables it.
         geometryRegularization: GeometryRegularization? = nil,
         onThermalThrottle: ((ThermalThrottleState) -> Void)? = nil,
+        // A small picture of the model every few seconds (for the App's training screen).
+        onPreview: ((TrainingPreviewFrame) -> Void)? = nil,
         onSnapshot: ((GaussianModel, Int) -> Void)?,
         log: (String) -> Void
     ) throws -> Result {
@@ -169,6 +171,8 @@ extension TrainingDriver {
 
         // Wall time of the previous step (used for the sleep amount when serious).
         var lastStepSeconds = 0.0
+        var lastPreviewAt = Date.distantPast
+        var previewsSent = 0
         var thermal = ThermalGovernor(seriousThrottleFactor: seriousThrottleFactor, onChange: onThermalThrottle)
         for it in 0..<iterations {
             thermal.beforeStep(iteration: it, lastStepSeconds: lastStepSeconds, log: log)
@@ -281,6 +285,19 @@ extension TrainingDriver {
             // Pass the post-step model to the live viewer (between steps, so no concurrent
             // mutation).
             onSnapshot?(model, it)
+            // The picture of the model, from a view that changes every other picture.
+            if let onPreview, !views.isEmpty,
+               Date().timeIntervalSince(lastPreviewAt) >= TrainingPreviewFrame.interval {
+                lastPreviewAt = Date()
+                autoreleasepool {
+                    let index = TrainingPreviewFrame.viewIndex(forPreview: previewsSent, viewCount: views.count)
+                    if let frame = TrainingPreviewFrame.render(
+                        trainer: trainer, camera: views[index].camera, shDegree: shDegree) {
+                        onPreview(frame)
+                        previewsSent += 1
+                    }
+                }
+            }
             // Always print the final iter too (so it does not look like it stopped early).
             if logEvery > 0 && (it % logEvery == 0 || it == iterations - 1) {
                 // 1 iter = 1 view, so the raw loss swings a lot per view. Use a window of the view
@@ -468,6 +485,7 @@ extension TrainingDriver {
         logEvery: Int = 50,
         onProgress: ((Int, Float) -> Void)? = nil,
         onThermalThrottle: ((ThermalThrottleState) -> Void)? = nil,
+        onPreview: ((TrainingPreviewFrame) -> Void)? = nil,
         log: (String) -> Void
     ) throws -> Result {
         let trainer = session.trainer
@@ -492,6 +510,8 @@ extension TrainingDriver {
         // continuation too).
         var thermal = ThermalGovernor(seriousThrottleFactor: 1.0, onChange: onThermalThrottle)
         var lastStepSeconds = 0.0
+        var lastPreviewAt = Date.distantPast
+        var previewsSent = 0
         for i in 0..<additionalIterations {
             thermal.beforeStep(iteration: startIter + i, lastStepSeconds: lastStepSeconds, log: log)
             let t0 = Date()
@@ -513,6 +533,17 @@ extension TrainingDriver {
                 log("extra iter \(cumulative): loss \(String(format: "%.4f", loss)) (\(trainer.model.count) gaussians)")
             }
             onProgress?(i + 1, loss)
+            if let onPreview, Date().timeIntervalSince(lastPreviewAt) >= TrainingPreviewFrame.interval {
+                lastPreviewAt = Date()
+                autoreleasepool {
+                    let index = TrainingPreviewFrame.viewIndex(forPreview: previewsSent, viewCount: views.count)
+                    if let frame = TrainingPreviewFrame.render(
+                        trainer: trainer, camera: views[index].camera, shDegree: shDegree) {
+                        onPreview(frame)
+                        previewsSent += 1
+                    }
+                }
+            }
         }
         session.totalIterations += additionalIterations
 

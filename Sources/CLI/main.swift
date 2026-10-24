@@ -53,7 +53,7 @@ func usage() {
     print("           (cells SEED_CELL_PX=<pixels across at the seen depth>, default 16; SEED_LIDAR_WEIGHT=<w>, default 1)")
     print("         LIDAR_COLOR=0 leaves the LiDAR seed points mid-grey instead of colored from the images")
     print("         LIDAR_SURFACE=0 lets pixels where LiDAR measured a surface count as background again")
-    print("         MESH_OBJ=<path.obj> after training, builds the mesh as the app's Generate mesh: from the trained")
+    print("         MESH_OBJ=<path.obj> after training, builds the mesh as the app does after training: from the trained")
     print("           Gaussians' surface depth (from training's MVS depth with GEO_REG=0); MESH_VOXEL=<m> (default")
     print("           0.005) / MESH_TRUNC=<voxels> (default 4) / MESH_MIN_WEIGHT (default 3) /")
     print("           MESH_MIN_COMPONENT=<tris> (default 200) / MESH_MAX_VOXELS (default 12M)")
@@ -458,7 +458,7 @@ case "train-capture":
                 training: split.training, heldOut: split.heldOut,
                 to: outputPLY.deletingPathExtension().appendingPathExtension("split.json"))
         }
-        // MESH_OBJ=<path.obj>: after training, build the mesh as the app's Generate mesh does
+        // MESH_OBJ=<path.obj>: after training, build the mesh as the app does
         // (MESH_* knobs in MeshCapture.swift).
         if let meshOBJ = env["MESH_OBJ"].map({ URL(fileURLWithPath: $0) }),
            !(try writeCaptureMesh(geometry: geometry, session: result.session,

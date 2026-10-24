@@ -67,11 +67,11 @@ and compiled to Metal.
 
 1. In the **Capture** tab, tap **Start capture** and walk slowly around the subject. Keep it in view
    and cover it from several heights.
-2. Tap **Stop**, then **Train this capture**. Choose the number of iterations and the Gaussian cap,
-   and tap **Start training**.
-3. When training finishes, tap **View** to open the result. From there you can **Train more**,
-   **Generate mesh** or **Export**. Trained models are listed in the **Library** tab and in the Files
-   app.
+2. Tap **Stop**. The same screen now shows the capture; choose the number of iterations and the
+   Gaussian cap, and tap **Start training**. Progress appears in place.
+3. When training finishes, a mesh is generated automatically and the result opens in the viewer.
+   From there you can **Share** the files, **Train more**, or tap **Hint** for the controls. Trained
+   models are listed in the **Library** tab and in the Files app.
 
 Tips: even lighting and a textured subject give the best results. Shiny, transparent and plain
 white surfaces are hard to reconstruct.
@@ -177,6 +177,11 @@ We referred to the code of these projects while writing our own:
 - [splat-transform](https://github.com/playcanvas/splat-transform) (MIT): the compressed PLY, SOG
   and glTF (KHR_gaussian_splatting) export layouts, and the codebook quantization and Morton order
   used by them
+
+The animations in the app (`scripts/media/`) are drawn with these fonts, all under the SIL Open Font
+License 1.1: [Instrument Serif](https://github.com/Instrument/instrument-serif),
+[Lora](https://github.com/cyrealtype/Lora-Cyrillic) and
+[Noto Sans JP](https://github.com/notofonts/noto-cjk).
 
 Main papers:
 

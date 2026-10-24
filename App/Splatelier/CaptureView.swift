@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Splatelier contributors
 //
-// Capture screen. Handles pre-capture settings, the live AR preview during capture, the result card
-// after capture, crash recovery and the list of validation datasets (.valset).
+// Capture screen. Handles pre-capture settings, the live AR preview during capture, and, in the
+// same screen, what follows: the result card with the training settings, the training progress,
+// crash recovery and the list of validation datasets (.valset). Only the finished result is
+// pushed (the viewer).
 
 import SwiftUI
 import UIKit
@@ -15,16 +17,26 @@ struct CaptureView: View {
     /// LiDAR depth during capture (LiDAR devices only). Still experimental, so off by default.
     @AppStorage("capture.useLiDAR") private var useLiDAR = false
 
+    // MARK: training (in this screen)
+    /// Set once there is something to train: a fresh capture, a resumed dataset or a validation
+    /// dataset. The training panel replaces the start screen while it is set.
+    @State private var trainer: TrainingViewModel?
+    /// The trainer holds the capture just made (not saved until trained), not a stored dataset.
+    @State private var trainerIsFreshCapture = false
+    /// Name and frame count of the stored dataset being trained (header card).
+    @State private var storedName = ""
+    @State private var storedFrameCount = 0
+
     // MARK: crash recovery
     /// Preserved dataset (*.dataset) left over from a previous crash. Detected at launch.
     @State private var pendingDatasetURL: URL?
     @State private var showResumePrompt = false
     @State private var didCheckRecovery = false
-    @State private var resumeTarget: ResumeTarget?
     @State private var recoveryError: String?
 
     // MARK: validation datasets
     @State private var validationSets: [ValidationEntry] = []
+    @State private var showValidationList = false
     @State private var loadingValidationURL: URL?
     @State private var showValsetNamePrompt = false
     @State private var valsetNameText = ""
@@ -35,20 +47,6 @@ struct CaptureView: View {
     @State private var zippingValsetURL: URL?
     /// The finished zip. Non-nil presents the share sheet.
     @State private var valsetShareItem: ShareableFile?
-
-    /// Restored result used to push TrainingView. With `preserve` (validation dataset), the dataset
-    /// is not deleted after training finishes.
-    private struct ResumeTarget: Identifiable, Hashable {
-        let id = UUID()
-        let scene: CapturedScene
-        let datasetURL: URL
-        let preserve: Bool
-        let name: String   // Display name to carry over; "" if none
-
-        // CapturedScene is not Hashable, so compare equality by id.
-        static func == (lhs: ResumeTarget, rhs: ResumeTarget) -> Bool { lhs.id == rhs.id }
-        func hash(into hasher: inout Hasher) { hasher.combine(id) }
-    }
 
     /// One row of the validation dataset list (read from the manifest only).
     private struct ValidationEntry: Identifiable, Hashable {
@@ -84,9 +82,12 @@ struct CaptureView: View {
             // capture start does not wait)
             CaptureSurfelRenderer.prewarm()
         }
-        .navigationDestination(item: $resumeTarget) { target in
-            TrainingView(scene: target.scene, resumeDatasetURL: target.datasetURL,
-                         preserveDataset: target.preserve, initialName: target.name)
+        // The capture just made becomes the thing to train.
+        .onChange(of: vm.capturedScene != nil) { _, hasScene in
+            if hasScene, trainer == nil, let scene = vm.capturedScene {
+                trainer = TrainingViewModel(scene: scene)
+                trainerIsFreshCapture = true
+            }
         }
         .alert("Unfinished capture found", isPresented: $showResumePrompt) {
             Button("Open") { resumePendingDataset() }
@@ -105,13 +106,13 @@ struct CaptureView: View {
             Text(recoveryError ?? "")
         }
         .onDisappear { vm.cancel() }
-        // A captured scene is not saved until it is trained, so confirm before recapturing.
+        // A captured scene is not saved until it is trained, so confirm before discarding it.
         .confirmationDialog(
             "Discard this capture?",
             isPresented: $showDiscardConfirm,
             titleVisibility: .visible
         ) {
-            Button("Discard and go back", role: .destructive) { vm.discardCapturedScene() }
+            Button("Discard and go back", role: .destructive) { endTraining() }
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("If you haven't trained it or used \"Save for validation\", the capture data will be lost. This can't be undone.")
@@ -125,28 +126,92 @@ struct CaptureView: View {
         }
     }
 
+    @ViewBuilder
     private var setupView: some View {
+        if let trainer {
+            TrainingView(
+                vm: trainer, header: trainingHeader, onClose: closeTraining,
+                closeDiscards: trainerIsFreshCapture)
+        } else if vm.capturedScene != nil {
+            // The capture just finished; the training panel appears on the next update.
+            Color.clear
+        } else {
+            startView
+        }
+    }
+
+    private var startView: some View {
         VStack(spacing: 24) {
-            if let scene = vm.capturedScene {
-                resultCard(scene)
+            // Keep the card fixed on screen and scroll only the validation dataset list inside it.
+            VStack(spacing: 24) {
+                if !validationSets.isEmpty { validationListButton }
                 if let err = vm.errorMessage { errorRow(err) }
-                Spacer()
-            } else {
-                // Keep the card fixed on screen and scroll only the validation dataset list inside
-                // it.
-                VStack(spacing: 24) {
-                    if !validationSets.isEmpty { validationDatasetsCard }
-                    if let err = vm.errorMessage { errorRow(err) }
-                }
-                .frame(maxHeight: .infinity, alignment: .top)
-                if ARKitCaptureSession.isLiDARAvailable {
-                    Toggle("LiDAR depth (experimental)", isOn: $useLiDAR)
-                        .padding(.horizontal)
-                }
+                // Capture tips (a different clip each time this screen appears).
+                GuideClipView()
+                    .frame(maxHeight: .infinity)
+            }
+            .frame(maxHeight: .infinity, alignment: .top)
+            if ARKitCaptureSession.isLiDARAvailable {
+                Toggle("LiDAR depth (experimental)", isOn: $useLiDAR)
+                    .padding(.horizontal)
             }
             controlRow
         }
         .padding()
+        .sheet(isPresented: $showValidationList) { validationListSheet }
+        // The last dataset was deleted: nothing left to list.
+        .onChange(of: validationSets.isEmpty) { _, isEmpty in
+            if isEmpty { showValidationList = false }
+        }
+    }
+
+    /// What is being trained, above the settings.
+    private var trainingHeader: AnyView {
+        if trainerIsFreshCapture, let scene = vm.capturedScene {
+            return AnyView(resultCard(scene))
+        }
+        return AnyView(
+            VStack(alignment: .leading, spacing: 8) {
+                Label(storedName.isEmpty ? "Saved capture" : storedName, systemImage: "flask")
+                    .font(.headline)
+                row("Frames", "\(storedFrameCount)")
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .cardBackground()
+        )
+    }
+
+    /// The button at the bottom of the training panel. A fresh capture that was not trained yet
+    /// asks first; everything else just goes back to the start screen.
+    private func closeTraining() {
+        if trainerIsFreshCapture, let trainer, !isTrained(trainer) {
+            showDiscardConfirm = true
+        } else {
+            endTraining()
+        }
+    }
+
+    private func isTrained(_ trainer: TrainingViewModel) -> Bool {
+        if case .completed = trainer.phase { return true }
+        return false
+    }
+
+    /// Back to the start screen. A fresh capture is released here (it is saved by training, or
+    /// the user chose to discard it).
+    private func endTraining() {
+        if trainerIsFreshCapture { vm.discardCapturedScene() }
+        trainer = nil
+        trainerIsFreshCapture = false
+    }
+
+    /// Starts the training panel for a dataset read from storage.
+    private func startStoredTraining(scene: CapturedScene, url: URL, preserve: Bool, name: String) {
+        storedName = name
+        storedFrameCount = scene.frames.count
+        trainerIsFreshCapture = false
+        trainer = TrainingViewModel(
+            scene: scene, resumeDatasetURL: url, preserveDataset: preserve, initialName: name)
     }
 
     private var liveCaptureView: some View {
@@ -209,37 +274,39 @@ struct CaptureView: View {
     // MARK: - subviews
 
     private func resultCard(_ scene: CapturedScene) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             Label("Capture complete", systemImage: "checkmark.circle.fill")
                 .font(.headline)
                 .foregroundStyle(.green)
-            row("Frames", "\(scene.frames.count)")
-            row("Sparse points", "\(scene.sparsePoints.count)")
-            row("Tracking", vm.diagnostics.trackingStateDescription)
-            row("Anchor updates", "\(vm.diagnostics.anchorUpdateCount)")
-            row("Unsettled anchors", "\(vm.diagnostics.unsettledAnchorCount)")
+            Text("\(scene.frames.count) frames · \(scene.sparsePoints.count) points")
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
+            // Only what needs attention. The detailed ARKit counters are in the processing log.
             if vm.diagnostics.relocalizationOccurred {
-                Label("Relocalization observed",
-                      systemImage: "exclamationmark.triangle.fill")
+                Label("Relocalization observed", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
-            Button { showFrameReview = true } label: {
-                Label("Review frames", systemImage: "photo.stack")
-                    .frame(maxWidth: .infinity)
+            if let warning = Self.trackingWarning(vm.diagnostics.trackingStateDescription) {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .padding(.top, 4)
-            validationSaveRow
-            NavigationLink(destination: TrainingView(scene: scene)) {
-                Label("Train this capture", systemImage: "wand.and.stars")
-                    .fontWeight(.semibold)
-                    .frame(maxWidth: .infinity)
+            HStack(spacing: 8) {
+                Button { showFrameReview = true } label: {
+                    Label("Review frames", systemImage: "photo.stack")
+                        .font(.subheadline)
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                validationSaveButton
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .padding(.top, 4)
+            .padding(.top, 2)
+            if case .failed(let msg) = vm.validationSaveState {
+                Text("Couldn't save: \(msg)").font(.caption).foregroundStyle(.red)
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -251,28 +318,48 @@ struct CaptureView: View {
         }
     }
 
+    /// A warning for the tracking state ARKit reported when capture stopped, or nil when it was
+    /// fine. The state strings come from ARKitCaptureSession: "normal", "notAvailable",
+    /// "limited(.excessiveMotion)", "limited(.insufficientFeatures)", "limited(.initializing)",
+    /// "limited(.relocalizing)", "limited(.other)", and "idle" before any frame.
+    static func trackingWarning(_ state: String) -> String? {
+        switch state {
+        case "normal", "idle": return nil
+        case "notAvailable": return "Tracking was not available when you stopped"
+        case "limited(.excessiveMotion)": return "Tracking was limited by fast motion when you stopped"
+        case "limited(.insufficientFeatures)":
+            return "Tracking was limited by too little detail when you stopped"
+        case "limited(.initializing)": return "Tracking was still starting when you stopped"
+        case "limited(.relocalizing)": return "Tracking was recovering its position when you stopped"
+        default:
+            // "limited(.other)", or a message the capture session reported in this field.
+            return state.hasPrefix("limited") ? "Tracking was limited when you stopped" : nil
+        }
+    }
+
+    /// Next to Review frames: saves the capture as a validation dataset.
     @ViewBuilder
-    private var validationSaveRow: some View {
+    private var validationSaveButton: some View {
         switch vm.validationSaveState {
-        case .saved(let name):
-            Label("Saved for validation (\(name))", systemImage: "checkmark.circle.fill")
-                .font(.caption)
+        case .saved:
+            Label("Saved", systemImage: "checkmark.circle.fill")
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, minHeight: 32)
                 .foregroundStyle(.green)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 4)
         default:
             let saving = vm.validationSaveState == .saving
             Button { valsetNameText = ""; showValsetNamePrompt = true } label: {
                 HStack(spacing: 6) {
                     if saving { ProgressView() }
                     Label(saving ? "Saving…" : "Save for validation", systemImage: "flask")
+                        .font(.subheadline)
+                        .lineLimit(1).minimumScaleFactor(0.8)
                 }
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-            .controlSize(.large)
+            .controlSize(.regular)
             .disabled(saving)
-            .padding(.top, 4)
             .alert("Validation dataset name", isPresented: $showValsetNamePrompt) {
                 TextField("e.g. Sofa test (optional)", text: $valsetNameText)
                 Button("Save") { vm.saveValidationDataset(displayName: valsetNameText) }
@@ -280,33 +367,53 @@ struct CaptureView: View {
             } message: {
                 Text("If left empty, the date and time are used.")
             }
-            if case .failed(let msg) = vm.validationSaveState {
-                Text("Couldn't save: \(msg)").font(.caption).foregroundStyle(.red)
-            }
         }
     }
 
     /// List of saved *.valset. Loading one proceeds to training.
-    private var validationDatasetsCard: some View {
+    /// One row that opens the saved-dataset list, so the start screen stays just "Start capture".
+    private var validationListButton: some View {
+        Button { showValidationList = true } label: {
+            HStack {
+                Label("Validation datasets", systemImage: "flask")
+                Spacer()
+                Text("\(validationSets.count)").foregroundStyle(.secondary)
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding()
+            .frame(maxWidth: .infinity)
+            .cardBackground()
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var validationListSheet: some View {
+        NavigationStack {
+            ScrollView {
+                validationDatasetsList
+                    .padding()
+            }
+            .appBackground()
+            .navigationTitle("Validation datasets")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { showValidationList = false }
+                }
+            }
+        }
+    }
+
+    private var validationDatasetsList: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("Validation datasets", systemImage: "flask")
-                .font(.headline)
             Text("Train on saved captures as often as you like (for comparing settings).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            // While it fits, shrink the card to its content height; only when it overflows, scroll
-            // within the remaining height.
-            ViewThatFits(in: .vertical) {
-                validationRows
-                ScrollView {
-                    validationRows
-                }
-                .scrollIndicatorsFlash(onAppear: true)
-            }
+            validationRows
         }
-        .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .cardBackground()
         .alert("Rename", isPresented: Binding(
             get: { renamingValset != nil },
             set: { if !$0 { renamingValset = nil } }
@@ -364,6 +471,7 @@ struct CaptureView: View {
                                 Label("Train", systemImage: "wand.and.stars")
                             }
                             .buttonStyle(.borderedProminent)
+                            .tint(Color.kikyoFill)
                             .controlSize(.small)
                             .disabled(loadingValidationURL != nil)
                             // Share / rename / delete go in a menu to prevent mis-taps next to the
@@ -421,6 +529,7 @@ struct CaptureView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(Color.kikyoFill)
                 .controlSize(.large)
             case .stopping:
                 ProgressView("Finalising…")
@@ -429,22 +538,14 @@ struct CaptureView: View {
         }
     }
 
-    /// After capture, the primary action goes to "Train this capture" and this becomes the
-    /// secondary action (discard the captured scene and return to the initial screen).
-    @ViewBuilder
     private var captureStartButton: some View {
-        let hasScene = vm.capturedScene != nil
-        let button = Button(action: { if hasScene { showDiscardConfirm = true } else { vm.start(useLiDAR: useLiDAR) } }) {
-            Label(hasScene ? "Capture again" : "Start capture",
-                  systemImage: hasScene ? "arrow.counterclockwise" : "record.circle")
+        Button(action: { vm.start(useLiDAR: useLiDAR) }) {
+            Label("Start capture", systemImage: "record.circle")
                 .frame(maxWidth: .infinity)
         }
+        .buttonStyle(.borderedProminent)
+        .tint(Color.kikyoFill)
         .controlSize(.large)
-        if hasScene {
-            button.buttonStyle(.bordered)
-        } else {
-            button.buttonStyle(.borderedProminent)
-        }
     }
 
     private func row(_ label: String, _ value: String) -> some View {
@@ -462,21 +563,21 @@ struct CaptureView: View {
     private func checkForRecoverableDataset() {
         guard !didCheckRecovery else { return }
         didCheckRecovery = true
-        guard !isLive, vm.capturedScene == nil,
+        guard !isLive, vm.capturedScene == nil, trainer == nil,
               let url = Self.mostRecentPendingDataset() else { return }
         pendingDatasetURL = url
         showResumePrompt = true
     }
 
-    /// Decode the preserved dataset in the background and navigate to TrainingView.
+    /// Decode the preserved dataset in the background and open the training panel for it.
     private func resumePendingDataset() {
         guard let url = pendingDatasetURL else { return }
         Task.detached {
             do {
                 let scene = try CaptureDatasetStore.load(from: url)
                 await MainActor.run {
-                    resumeTarget = ResumeTarget(
-                        scene: scene, datasetURL: url, preserve: false,
+                    startStoredTraining(
+                        scene: scene, url: url, preserve: false,
                         name: CaptureMetadataName.load(for: url) ?? "")
                 }
             } catch {
@@ -532,7 +633,7 @@ struct CaptureView: View {
         validationSets = out.sorted { $0.modifiedAt > $1.modifiedAt }
     }
 
-    /// Load a validation dataset in the background and navigate to TrainingView.
+    /// Load a validation dataset in the background and open the training panel for it.
     private func loadValidationDataset(_ url: URL) {
         guard loadingValidationURL == nil else { return }
         loadingValidationURL = url
@@ -541,13 +642,15 @@ struct CaptureView: View {
                 let scene = try CaptureDatasetStore.load(from: url)
                 await MainActor.run {
                     loadingValidationURL = nil
-                    resumeTarget = ResumeTarget(
-                        scene: scene, datasetURL: url, preserve: true,
+                    showValidationList = false
+                    startStoredTraining(
+                        scene: scene, url: url, preserve: true,
                         name: CaptureMetadataName.load(for: url) ?? "")
                 }
             } catch {
                 await MainActor.run {
                     loadingValidationURL = nil
+                    showValidationList = false
                     recoveryError = "\(error)"
                 }
             }

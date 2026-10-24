@@ -24,16 +24,20 @@ and compiled to Metal.
 
 ## Features
 
-- **Guided capture**: ARKit images and poses, blur and exposure filtering while you capture, and a
-  live splat preview that shows which parts of the scene are covered.
+- **Guided capture**: ARKit images and poses, blur and exposure filtering while you capture, a live
+  splat preview that shows which parts of the scene are covered, and short animated tips on the
+  start screen.
 - **On-device training**: bundle adjustment refines the ARKit poses, multi-view stereo provides dense
   seed points, and the Gaussians are trained on the iPhone's GPU. Training slows down when the device
   gets hot and pauses when iOS reports a critical thermal state. A finished model can be trained
-  further.
-- **Built-in viewer**: orbit the result, hide the background, and measure distances between two
-  points.
-- **Export**: standard 3DGS PLY files that common splat viewers can open, and a mesh (OBJ) generated
-  from the trained scene. Files are available in the Files app.
+  further. Capture, the training settings and the training are one screen, with one progress bar
+  and a picture of the model that sharpens as it trains.
+- **Built-in viewer**: orbit the result, choose the layers to show (splats, background, mesh, seed
+  points), and measure distances between two points. The Library lists your captures and opens
+  `.ply`, `.splat` and `.spz` files you import.
+- **Export**: share the splats as a standard 3DGS PLY (common splat viewers open it), compressed
+  PLY, SPZ, `.splat`, glTF (GLB) or SOG, and the mesh (OBJ) generated from the trained scene, from
+  the viewer or the Library. Files are also available in the Files app.
 - **Mac tools**: retrain a capture from the app on a Mac, train and evaluate on COLMAP scenes, and
   inspect PLY files from the command line. `splatelier convert` turns a PLY into compressed PLY, SPZ,
   .splat, glTF (GLB) or SOG.
@@ -41,7 +45,8 @@ and compiled to Metal.
 ## Requirements
 
 - An iPhone or iPad with iOS 18 or later. ARKit capture and training need a real device. LiDAR
-  is not required.
+  is not required; on devices that have it, an experimental switch on the Capture screen records
+  LiDAR depth as well and uses it for the seed points (off by default).
 - An Apple Silicon Mac with macOS 15 or later and Xcode 16 (iOS 18 SDK) to build the app.
 - An Apple account added to Xcode as a development team, to sign the app.
 
@@ -94,6 +99,8 @@ eval | compare | render                                   evaluate on a COLMAP s
 train-capture <dataset.valset> <output.ply> [iterations]  retrain an app capture with the app's
                                                           settings (MESH_OBJ=<path> also writes a mesh)
 view | capture | stats | cull                             viewer and PLY tools
+convert <in.ply> <out.ext> [shDegree]                     convert a PLY to compressed PLY, SPZ, .splat,
+                                                          GLB or SOG
 ```
 
 - A capture can be saved from the app as a `.valset` dataset and shared to the Mac.
@@ -127,15 +134,29 @@ The generated `.metal` and `.refl.json` files are checked in under `Sources/Trai
 so Slang is only needed to edit `.slang` kernels. Generation is deterministic, so comment-only edits
 leave them unchanged.
 
+### Animations
+
+The launch animation and the capture-guide clips are rendered by `scripts/media/`
+(`scripts/media/build_media.sh`; see its [README](scripts/media/README.md)). The videos are checked
+in, so this is only needed to change them.
+
+### Continuous integration
+
+CI builds the package and the iOS app, and checks that the generated Metal kernels match their Slang
+sources. It does not run the tests, because most of them need a Metal GPU: run `make test` locally.
+
 ### How it works
 
-- **Poses and seed points**: bundle adjustment over ORB and ARKit feature tracks, and dense seed
-  points from multi-view stereo (plane sweep + SGM).
+- **Poses and seed points**: bundle adjustment over ORB and ARKit feature tracks (the points are
+  eliminated by per-point QR and the reduced system is solved with Accelerate), and dense seed
+  points from multi-view stereo (plane sweep + SGM). With the experimental LiDAR switch, LiDAR depth,
+  reprojected with the refined poses, joins the seed points.
 - **Training**: PocketGS disc-like initialization and replay cache; a hybrid of MCMC and ImprovedGS+
   long-axis split for densification; a directional spherical-harmonics background; fused SSIM;
   coarse-to-fine; thermal throttling; continued training with the Adam state kept.
 - **Output**: a standard 3DGS PLY (SH degree 1, written in the degree-3 layout so common viewers read
-  it) with the background baked into a far shell of Gaussians, and a TSDF mesh.
+  it) with the background baked into a far shell of Gaussians, and a TSDF mesh that is generated
+  automatically after training.
 - **Viewer**: [MetalSplatter](https://github.com/scier/MetalSplatter) with local patches: blending that
   matches training, stochastic transparency while the camera moves, a mesh overlay, hiding the
   background and distance measurement. See [VENDORED.md](Vendor/MetalSplatter/VENDORED.md).
@@ -148,6 +169,7 @@ Sources/Trainer/           renderer, trainer, densification, BA and MVS, PLY I/O
 Sources/Capture/           ARKit capture, training from captures, .valset storage
 Sources/SplatViewerKit/    SwiftUI + MetalKit viewer
 Sources/CLI/               command-line tool
+scripts/                   build, release and animation scripts (scripts/media/ renders the animations)
 slang/                     Slang kernel sources
 Vendor/MetalSplatter/      vendored MetalSplatter with local patches
 Tests/                     unit and GPU tests

@@ -243,11 +243,18 @@ public enum CaptureDatasetStore {
             guard data.count % stride == 0 else {
                 throw StoreError.corruptManifest("LiDAR byte count \(data.count) for \(file)")
             }
-            let flat = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-            return Swift.stride(from: 0, to: flat.count, by: lidarSampleFloats).map { i in
-                LiDARSample(cameraPoint: SIMD3(flat[i], flat[i + 1], flat[i + 2]),
-                            confidenceLevel: UInt8(flat[i + 4]), depthSpread: flat[i + 3])
+            let flat: [Float] = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            // A loop with typed locals: the newest compiler (CI) gave up type-checking the one-line
+            // `map` over the same expression.
+            var samples: [LiDARSample] = []
+            samples.reserveCapacity(flat.count / lidarSampleFloats)
+            for i in Swift.stride(from: 0, to: flat.count, by: lidarSampleFloats) {
+                let point = SIMD3<Float>(flat[i], flat[i + 1], flat[i + 2])
+                let spread: Float = flat[i + 3]
+                let level = UInt8(flat[i + 4])
+                samples.append(LiDARSample(cameraPoint: point, confidenceLevel: level, depthSpread: spread))
             }
+            return samples
         }
         return unpackPoints(r.lidarCameraPoints ?? []).map {
             LiDARSample(cameraPoint: $0, confidenceLevel: 1, depthSpread: 0)

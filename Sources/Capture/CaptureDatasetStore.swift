@@ -60,7 +60,7 @@ public final class CaptureDatasetFiles: @unchecked Sendable {
 }
 
 public enum CaptureDatasetStore {
-    public static let version = 2
+    public static let version = 3
 
     public enum StoreError: Swift.Error { case corruptManifest(String) }
 
@@ -85,7 +85,15 @@ public enum CaptureDatasetStore {
         // IDs exceed 2^53 and lose precision as JSON doubles, so they are stored as strings.
         var featureTrackIDs: [String]?
         var featureCameraPoints: [Float]?   // flattened xyz
+        // LiDAR samples: relative path "frames/00000.lidar", little-endian float32 ×
+        // `lidarSampleFloats` per sample (nil without LiDAR and in old datasets).
+        var lidarFile: String?
+        // LiDAR sample positions only, from datasets saved before `lidarFile` (read only).
+        var lidarCameraPoints: [Float]?     // flattened xyz
     }
+
+    /// Floats per sample in a `.lidar` file: camera x, y, z, depth spread, confidence level.
+    static let lidarSampleFloats = 5
 
     /// Saves `scene` to `directory`. Written to a temp directory and moved, so a partial write is
     /// never mistaken for a complete one. The frames can then release their images to it
@@ -115,7 +123,9 @@ public enum CaptureDatasetStore {
                 featureTrackIDs: f.featureObservations.isEmpty
                     ? nil : f.featureObservations.map { String($0.trackID) },
                 featureCameraPoints: f.featureObservations.isEmpty
-                    ? nil : packPoints(f.featureObservations.map(\.cameraPoint))
+                    ? nil : packPoints(f.featureObservations.map(\.cameraPoint)),
+                lidarFile: f.lidarSamples.isEmpty
+                    ? nil : try writeLiDARSamples(f.lidarSamples, to: tmp, index: i)
             ))
         }
 
@@ -196,7 +206,8 @@ public enum CaptureDatasetStore {
                 width: r.width, height: r.height,
                 timestamp: r.timestamp,
                 anchorIdentifier: r.anchorIdentifier.flatMap(UUID.init(uuidString:)),
-                featureObservations: featureObs
+                featureObservations: featureObs,
+                lidarSamples: try readLiDARSamples(r, from: directory)
             )
             frame.imageStorage.attach(files, path: r.imageFile)
             frames.append(frame)
@@ -209,6 +220,45 @@ public enum CaptureDatasetStore {
             lidarPoints: unpackPoints(manifest.lidarPoints),
             diagnostics: nil
         )
+    }
+
+    /// Writes `samples` next to the frame image and returns the relative path.
+    private static func writeLiDARSamples(_ samples: [LiDARSample], to dir: URL, index: Int) throws -> String {
+        let rel = String(format: "frames/%05d.lidar", index)
+        var flat: [Float] = []
+        flat.reserveCapacity(samples.count * lidarSampleFloats)
+        for s in samples {
+            flat += [s.cameraPoint.x, s.cameraPoint.y, s.cameraPoint.z, s.depthSpread, Float(s.confidenceLevel)]
+        }
+        try flat.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: dir.appendingPathComponent(rel))
+        return rel
+    }
+
+    /// The frame's LiDAR samples: the `.lidar` file, else the positions of an older dataset at
+    /// medium confidence with no spread.
+    private static func readLiDARSamples(_ r: FrameRecord, from dir: URL) throws -> [LiDARSample] {
+        if let file = r.lidarFile {
+            let data = try Data(contentsOf: dir.appendingPathComponent(file))
+            let stride = lidarSampleFloats * MemoryLayout<Float>.size
+            guard data.count % stride == 0 else {
+                throw StoreError.corruptManifest("LiDAR byte count \(data.count) for \(file)")
+            }
+            let flat: [Float] = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            // A loop with typed locals: the newest compiler (CI) gave up type-checking the one-line
+            // `map` over the same expression.
+            var samples: [LiDARSample] = []
+            samples.reserveCapacity(flat.count / lidarSampleFloats)
+            for i in Swift.stride(from: 0, to: flat.count, by: lidarSampleFloats) {
+                let point = SIMD3<Float>(flat[i], flat[i + 1], flat[i + 2])
+                let spread: Float = flat[i + 3]
+                let level = UInt8(flat[i + 4])
+                samples.append(LiDARSample(cameraPoint: point, confidenceLevel: level, depthSpread: spread))
+            }
+            return samples
+        }
+        return unpackPoints(r.lidarCameraPoints ?? []).map {
+            LiDARSample(cameraPoint: $0, confidenceLevel: 1, depthSpread: 0)
+        }
     }
 
     /// Writes uint8 [H, W, 3] as raw bytes as is.

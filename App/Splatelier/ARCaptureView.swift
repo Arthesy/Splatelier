@@ -8,9 +8,9 @@
 // of captured areas are drawn on top in their real colors (CaptureSurfelRenderer, drawn directly
 // with Metal in SceneKit's render pass). Color fills in over the white guide where you have
 // captured. Splats are larger and blurrier where an area was only captured from far away, and
-// sharpen as you capture it up close.
+// sharpen as you capture it up close. With LiDAR, the LiDAR layer's splats are drawn with them.
 //
-// For feature points / LiDAR, coverage splats are drawn as point primitives. Before drawing the
+// For feature points, coverage splats are drawn as point primitives. Before drawing the
 // points, only their depth is written, hiding points that lie behind points of a nearer surface
 // (the back side of an object, surfaces behind an object).
 
@@ -32,6 +32,11 @@ struct ARCaptureView: UIViewRepresentable {
         let view = ARSCNView(frame: .zero)
         view.scene = SCNScene()
         view.rendersContinuously = true
+        // Every frame redraws all the semi-transparent surfels. With the LiDAR layer that is about
+        // 12 screens of blended fragments (2.5× MVS alone), so draw at half the default 60 then to
+        // cut the GPU heat during capture. ARKit still delivers frames to the capture session at
+        // the camera rate.
+        if captureSession.usesLiDARDepth { view.preferredFramesPerSecond = 30 }
         view.automaticallyUpdatesLighting = true
         // Share the in-progress capture session (this view does not run/pause it).
         if let session = captureSession.arSession {

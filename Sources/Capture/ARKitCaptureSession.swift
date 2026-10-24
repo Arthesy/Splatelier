@@ -44,8 +44,6 @@ public enum CaptureError: Error, Sendable, CustomStringConvertible {
 public enum LiveReconstructionMode: String, Sendable, CaseIterable {
     /// ARKit feature points (rawFeaturePoints). Sparse, but no extra cost.
     case featurePoints
-    /// Dense points from unprojecting LiDAR sceneDepth. LiDAR devices only.
-    case lidar
     /// Incremental MVS during capture (`LiveMVSReconstructor`, same method as MVS mode). Dense with
     /// the camera alone. rawValue keeps the old name so values saved by the old Mobile3DRecon
     /// implementation still load.
@@ -81,12 +79,14 @@ public struct CaptureConfiguration: Sendable {
     public var settleSeconds: TimeInterval
     /// Do not accept frames while tracking is not `.normal`.
     public var requireNormalTracking: Bool
-    /// Collect LiDAR sceneDepth into lidarPoints. No-op on devices without LiDAR.
+    /// Record LiDAR sceneDepth samples with each kept frame (`CapturedFrame.lidarSamples`);
+    /// with `.mvs` they are also drawn as a second surfel layer. No-op on devices without LiDAR.
     public var enableLiDARDepth: Bool
     /// Minimum LiDAR confidence (0=low / 1=medium / 2=high).
     /// An Int so ARConfidenceLevel is not exposed in the public type.
     public var lidarConfidenceMinRaw: Int
-    /// Subsampling stride (px) for the LiDAR depthMap.
+    /// Subsampling stride (px) of the LiDAR depthMap for the recorded samples. The live layer
+    /// samples at half of it.
     public var lidarStride: Int
     /// Run the image quality gate right after conversion. Rejected frames are neither saved nor
     /// shown in coverage.
@@ -175,7 +175,7 @@ public struct CaptureDiagnostics: Sendable {
     /// Frames that contributed LiDAR points. 0 with lidarSupported suggests confidence dropped
     /// every pixel.
     public var lidarFrameCount: Int
-    /// Cumulative LiDAR world points (after filtering and stride).
+    /// Cumulative recorded LiDAR samples (after filtering and stride).
     public var lidarPointCount: Int
     /// Frames evaluated by the quality gate (those that passed the motion gate and conversion).
     public var qualityCandidateFrameCount: Int
@@ -243,6 +243,9 @@ public final class ARKitCaptureSession {
     private let configuration: CaptureConfiguration
     /// Source of the live point cloud during capture (used by the overlay to switch its display).
     public var liveReconstructionMode: LiveReconstructionMode { configuration.liveReconstructionMode }
+    /// Whether this capture records LiDAR depth (enabled and the device has LiDAR). The overlay
+    /// then also draws the LiDAR layer.
+    public var usesLiDARDepth: Bool { configuration.enableLiDARDepth && Self.isLiDARAvailable }
     private let stateLock = NSLock()
     private var _state: CaptureState = .idle
     private var _diagnostics = CaptureDiagnostics()
@@ -307,7 +310,7 @@ public final class ARKitCaptureSession {
     }
 
     /// Display surfels during capture (`.mvs` only; drawn as splats that sharpen as you get
-    /// closer).
+    /// closer): the MVS surfels followed by the LiDAR layer's.
     public var liveSurfels: [CaptureSurfelMap.Surfel] {
         #if canImport(ARKit) && os(iOS)
         return iOSImpl?.liveSurfelsSnapshot ?? []
@@ -440,6 +443,8 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
         // ARKit feature points seen in this frame (OpenCV camera coordinates at the capture-time
         // pose)
         let featureObservations: [ARKitFeatureObservation]
+        // LiDAR samples of this frame
+        let lidarSamples: [LiDARSample]
     }
 
     private let configuration: CaptureConfiguration
@@ -455,14 +460,15 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
     private var _liveCoverageSplats: [CaptureCoverageSplat] = []
     private var _liveCoverageRevision = 0
     private var _liveSurfels: [CaptureSurfelMap.Surfel] = []
+    private var _liveLiDARSurfels: [CaptureSurfelMap.Surfel] = []
     private var _liveSurfelRevision = 0
-    // Sized to also hold the dense LiDAR points
     private var coverageAccumulator = CaptureCoverageAccumulator(
         voxelSizeMeters: 0.03, maxSplats: 60_000)
 
     fileprivate var liveSplatCount: Int {
         pointsLock.lock(); defer { pointsLock.unlock() }
-        return configuration.liveReconstructionMode == .mvs ? _liveSurfels.count : _liveCoverageSplats.count
+        return configuration.liveReconstructionMode == .mvs
+            ? _liveSurfels.count + _liveLiDARSurfels.count : _liveCoverageSplats.count
     }
 
     fileprivate var liveCoverageSplatsSnapshot: [CaptureCoverageSplat] {
@@ -477,7 +483,7 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
 
     fileprivate var liveSurfelsSnapshot: [CaptureSurfelMap.Surfel] {
         pointsLock.lock(); defer { pointsLock.unlock() }
-        return _liveSurfels
+        return _liveSurfels + _liveLiDARSurfels
     }
 
     fileprivate var liveSurfelRevision: Int {
@@ -485,8 +491,8 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
         return _liveSurfelRevision
     }
 
-    /// Feed world points into coverage and update the snapshot (shared by feature points and LiDAR,
-    /// on delegateQueue). `.mvs` shows surfels from `LiveMVSReconstructor` instead.
+    /// Feed world feature points into coverage and update the snapshot (on delegateQueue). `.mvs`
+    /// shows surfels from `LiveMVSReconstructor` and `LiveLiDARSurfels` instead.
     fileprivate func updateLiveCoverage(_ points: [SIMD3<Float>], timestamp: TimeInterval) {
         guard !points.isEmpty else { return }
         coverageAccumulator.insert(points, timestamp: timestamp)
@@ -513,7 +519,7 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
     // Anchor-local record of rawFeaturePoints. On re-observation the first anchor is kept, so loop
     // closure corrections also propagate to the point cloud.
     private var featurePoints: [UInt64: LoopClosureResolver.AnchoredPoint] = [:]
-    private var lidarWorldPoints: [SIMD3<Float>] = []
+    private var lidarPointCount = 0
     private var lidarFrameCount = 0
     private var lidarSupportedRuntime = false
     private var lastTrackingStateDescription = "idle"
@@ -521,6 +527,8 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
     // For .mvs mode only (managed on delegateQueue)
     private var liveMVS: LiveMVSReconstructor?
     private var liveMVSSummary: String?
+    // For .mvs mode with LiDAR only
+    private var liveLiDAR: LiveLiDARSurfels?
 
     init(configuration: CaptureConfiguration) throws {
         self.configuration = configuration
@@ -554,7 +562,7 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
             self.exposureLockScheduled = false
             self.exposureLockDone = false
             self.stateChange = onStateChange
-            self.lidarWorldPoints.removeAll()
+            self.lidarPointCount = 0
             self.lidarFrameCount = 0
             self.lidarSupportedRuntime = lidarSupported
             self.lastTrackingStateDescription = "idle"
@@ -575,10 +583,28 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
             } else {
                 self.liveMVS = nil
             }
+            self.liveLiDAR?.cancel()
+            if self.configuration.liveReconstructionMode == .mvs, lidarSupported {
+                self.liveLiDAR = LiveLiDARSurfels(mvsSurfels: { [weak self] in
+                    guard let self else { return [] }
+                    self.pointsLock.lock()
+                    defer { self.pointsLock.unlock() }
+                    return self._liveSurfels
+                }, onSurfels: { [weak self] surfels in
+                    guard let self else { return }
+                    self.pointsLock.lock()
+                    self._liveLiDARSurfels = surfels
+                    self._liveSurfelRevision += 1
+                    self.pointsLock.unlock()
+                })
+            } else {
+                self.liveLiDAR = nil
+            }
             self.pointsLock.lock()
             self._liveCoverageSplats.removeAll()
             self._liveCoverageRevision += 1
             self._liveSurfels.removeAll()
+            self._liveLiDARSurfels.removeAll()
             self._liveSurfelRevision += 1
             self.pointsLock.unlock()
         }
@@ -605,6 +631,8 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
             self.capturing = false
             self.liveMVS?.stopAndWait()
             self.liveMVS = nil
+            self.liveLiDAR?.cancel()
+            self.liveLiDAR = nil
             self.session.pause()
             self.stopContinuation?.resume(throwing: CaptureError.notRunning)
             self.stopContinuation = nil
@@ -667,6 +695,9 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
             liveMVSSummary = mvs.stopAndWait()
             liveMVS = nil
         }
+        // Display only, so the queued frames are dropped instead of waited for.
+        liveLiDAR?.cancel()
+        liveLiDAR = nil
         guard let cont = stopContinuation else { return }
         stopContinuation = nil
 
@@ -684,7 +715,8 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
                 anchorID: p.anchorID, image: image,
                 intrinsics: p.intrinsics,
                 width: p.width, height: p.height, timestamp: p.timestamp,
-                featureObservations: p.featureObservations
+                featureObservations: p.featureObservations,
+                lidarSamples: p.lidarSamples
             ))
             if let cur = anchorTransforms[p.anchorID], cur == p.seedTransform {
                 unsettled += 1
@@ -712,13 +744,12 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
             unsettledAnchorCount: unsettled,
             lidarSupported: lidarSupportedRuntime,
             lidarFrameCount: lidarFrameCount,
-            lidarPointCount: lidarWorldPoints.count,
+            lidarPointCount: lidarPointCount,
             pixelBufferColorTags: pixelBufferColorTags,
             liveMVSSummary: liveMVSSummary
         )
         cont.resume(returning: CapturedScene(
             frames: frames, sparsePoints: worldPoints,
-            lidarPoints: lidarWorldPoints,
             diagnostics: diag
         ))
     }
@@ -877,13 +908,60 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
             }
         }
 
+        // LiDAR samples, recorded in camera coordinates so they follow BA and loop closure. The
+        // live layer draws them with the capture-time pose, at twice the density.
+        var lidarSamples: [LiDARSample] = []
+        if lidarSupportedRuntime, let sd = frame.sceneDepth {
+            let recordStride = max(1, configuration.lidarStride)
+            let liveStride = max(1, recordStride / 2)
+            let samples = DepthUnprojection.unproject(
+                depthMap: sd.depthMap,
+                confidenceMap: sd.confidenceMap,
+                cameraIntrinsics: intr,
+                imageResolution: origRes,
+                params: DepthUnprojection.Params(
+                    stride: liveStride,
+                    minConfidenceRaw: UInt8(configuration.lidarConfidenceMinRaw)
+                )
+            )
+            lidarSamples = samples
+                .filter { $0.x % recordStride == 0 && $0.y % recordStride == 0 }
+                .map { LiDARSample(cameraPoint: $0.cameraPoint, confidenceLevel: $0.confidenceLevel,
+                                   depthSpread: $0.depthSpread) }
+            if !lidarSamples.isEmpty {
+                lidarPointCount += lidarSamples.count
+                lidarFrameCount += 1
+                stateChange?(.lidarFrame(lidarFrameCount))
+                stateChange?(.lidarPoints(lidarPointCount))
+            }
+            if let liveLiDAR {
+                // OpenCV camera → ARKit camera: flip Y/Z
+                func toWorld(_ v: SIMD3<Float>, _ w: Float) -> SIMD3<Float> {
+                    let r = c2w * SIMD4<Float>(v.x, -v.y, -v.z, w)
+                    return SIMD3<Float>(r.x, r.y, r.z)
+                }
+                let points = samples.map { smp -> LiveLiDARSurfels.Point in
+                    let px = min(out.width - 1, Int(smp.uv.x * Float(out.width)))
+                    let py = min(out.height - 1, Int(smp.uv.y * Float(out.height)))
+                    let i = (py * out.width + px) * 3
+                    return LiveLiDARSurfels.Point(
+                        position: toWorld(smp.cameraPoint, 1), normal: toWorld(smp.normal, 0),
+                        color: SIMD3<Float>(Float(out.bytes[i]), Float(out.bytes[i + 1]), Float(out.bytes[i + 2])) / 255,
+                        footprint: smp.pixelSize * Float(liveStride))
+                }
+                liveLiDAR.submit(points, cameraCenter: SIMD3<Float>(c2w.columns.3.x, c2w.columns.3.y, c2w.columns.3.z),
+                                 frame: pending.count)
+            }
+        }
+
         pending.append(PendingFrame(
             anchorID: anchor.identifier,
             rgbBytes: out.bytes,
             width: out.width, height: out.height,
             intrinsics: scaled, timestamp: frame.timestamp,
             seedTransform: c2w,
-            featureObservations: featureObs
+            featureObservations: featureObs,
+            lidarSamples: lidarSamples
         ))
         lastKeptCameraToWorld = c2w
         hasKeptFirst = true
@@ -923,31 +1001,6 @@ private final class IOSImpl: NSObject, ARSessionDelegate {
             rgb: out.bytes, width: out.width, height: out.height,
             intrinsics: (fx: scaled.fx, fy: scaled.fy, cx: scaled.cx, cy: scaled.cy),
             cameraToWorld: c2w, newSparsePoints: newFeatureWorld)
-
-        // Accumulate LiDAR points in the same ARKit world coordinates as sparsePoints
-        if lidarSupportedRuntime, let sd = frame.sceneDepth {
-            let pts = DepthUnprojection.unprojectToWorld(
-                depthMap: sd.depthMap,
-                confidenceMap: sd.confidenceMap,
-                cameraIntrinsics: intr,
-                imageResolution: origRes,
-                cameraToWorld: c2w,
-                params: DepthUnprojection.Params(
-                    stride: configuration.lidarStride,
-                    minConfidenceRaw: UInt8(configuration.lidarConfidenceMinRaw)
-                )
-            )
-            if !pts.isEmpty {
-                lidarWorldPoints.append(contentsOf: pts)
-                lidarFrameCount += 1
-                stateChange?(.lidarFrame(lidarFrameCount))
-                stateChange?(.lidarPoints(lidarWorldPoints.count))
-                // In .lidar mode, also feed live coverage
-                if configuration.liveReconstructionMode == .lidar {
-                    updateLiveCoverage(pts, timestamp: frame.timestamp)
-                }
-            }
-        }
     }
 
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {

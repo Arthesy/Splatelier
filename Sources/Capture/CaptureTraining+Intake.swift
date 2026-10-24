@@ -35,7 +35,7 @@ extension CaptureTraining {
             log("[capture live-mvs] \(mvs)")
         }
         let baStr = scene.baRefinedPoints.map { String($0.count) } ?? "nil"
-        log("[capture intake] sparsePoints=\(scene.sparsePoints.count) baRefinedPoints=\(baStr) lidarPoints=\(scene.lidarPoints.count)")
+        log("[capture intake] sparsePoints=\(scene.sparsePoints.count) baRefinedPoints=\(baStr) lidarPoints=\(scene.lidarWorldPoints.count)")
         if d.relocalizationOccurred {
             log("[ARKit warn] reason=relocalization")
         }

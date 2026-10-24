@@ -14,6 +14,8 @@ struct CaptureView: View {
     @StateObject private var vm = CaptureViewModel()
     @State private var showDiscardConfirm = false
     @State private var showFrameReview = false
+    /// LiDAR depth during capture (LiDAR devices only). Still experimental, so off by default.
+    @AppStorage("capture.useLiDAR") private var useLiDAR = false
 
     // MARK: training (in this screen)
     /// Set once there is something to train: a fresh capture, a resumed dataset or a validation
@@ -149,6 +151,10 @@ struct CaptureView: View {
                     .frame(maxHeight: .infinity)
             }
             .frame(maxHeight: .infinity, alignment: .top)
+            if ARKitCaptureSession.isLiDARAvailable {
+                Toggle("LiDAR depth (experimental)", isOn: $useLiDAR)
+                    .padding(.horizontal)
+            }
             controlRow
         }
         .padding()
@@ -533,7 +539,7 @@ struct CaptureView: View {
     }
 
     private var captureStartButton: some View {
-        Button(action: { vm.start() }) {
+        Button(action: { vm.start(useLiDAR: useLiDAR) }) {
             Label("Start capture", systemImage: "record.circle")
                 .frame(maxWidth: .infinity)
         }

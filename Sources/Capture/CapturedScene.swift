@@ -5,6 +5,7 @@
 // ARAnchor ID so post-loop-closure pose updates can be applied.
 
 import Foundation
+import simd
 import MLX
 import Trainer
 
@@ -81,6 +82,36 @@ final class CapturedImageStorage: @unchecked Sendable {
     }
 }
 
+/// One recorded LiDAR depth sample of a frame.
+public struct LiDARSample: Sendable, Equatable {
+    /// OpenCV camera coordinates (m).
+    public let cameraPoint: SIMD3<Float>
+    /// ARConfidenceLevel raw value (0=low / 1=medium / 2=high).
+    public let confidenceLevel: UInt8
+    /// Largest depth difference to the adjacent depth pixels (m); large at depth edges.
+    public let depthSpread: Float
+
+    public init(cameraPoint: SIMD3<Float>, confidenceLevel: UInt8, depthSpread: Float) {
+        self.cameraPoint = cameraPoint
+        self.confidenceLevel = confidenceLevel
+        self.depthSpread = depthSpread
+    }
+
+    /// Fusion confidence in 0...1, the product of three terms in the manner of the ToF confidence
+    /// of Marin et al. (ECCV 2016, "Reliable Fusion of ToF and Stereo Depth Driven by Confidence
+    /// Measures"): ARKit's confidence level, a mixed-pixel term that falls to 0 as the spread to
+    /// the neighbors reaches `edgeRelative` of the depth, and a range term falling to 0 at
+    /// `maxRange`.
+    public func confidence(edgeRelative: Float = 0.1, maxRange: Float = 5) -> Float {
+        let z = cameraPoint.z
+        guard z > 0 else { return 0 }
+        let levelTerm: Float = confidenceLevel >= 2 ? 1 : confidenceLevel == 1 ? 0.5 : 0.25
+        let edgeTerm = Swift.max(0, 1 - depthSpread / (edgeRelative * z))
+        let rangeTerm = Swift.max(0, 1 - z / maxRange)
+        return levelTerm * edgeTerm * rangeTerm
+    }
+}
+
 /// Capture result for one frame. `intrinsics` are in pixels at the image resolution. Not Sendable
 /// because MLXArray is not thread-safe. Synchronize on the constructing side when crossing threads.
 public struct CapturedFrame {
@@ -118,13 +149,17 @@ public struct CapturedFrame {
     /// ARKit feature observations. Used by `CaptureBA` to build multi-view tracks. Empty for
     /// non-ARKit paths.
     public let featureObservations: [ARKitFeatureObservation]
+    /// LiDAR depth samples of this frame (empty without LiDAR). Moved to world with the frame's
+    /// final pose, so they follow BA and loop closure.
+    public let lidarSamples: [LiDARSample]
 
     public init(
         image: MLXArray, viewmat: [Float],
         intrinsics: Intrinsics,
         width: Int, height: Int,
         timestamp: TimeInterval, anchorIdentifier: UUID? = nil,
-        featureObservations: [ARKitFeatureObservation] = []
+        featureObservations: [ARKitFeatureObservation] = [],
+        lidarSamples: [LiDARSample] = []
     ) {
         precondition(viewmat.count == 16, "viewmat must be a row-major 4×4")
         precondition(image.shape.count == 3 && image.shape[2] == 3,
@@ -138,6 +173,7 @@ public struct CapturedFrame {
         self.timestamp = timestamp
         self.anchorIdentifier = anchorIdentifier
         self.featureObservations = featureObservations
+        self.lidarSamples = lidarSamples
     }
 
     private init(copying f: CapturedFrame, viewmat: [Float], intrinsics: Intrinsics,
@@ -151,6 +187,7 @@ public struct CapturedFrame {
         self.timestamp = f.timestamp
         self.anchorIdentifier = f.anchorIdentifier
         self.featureObservations = f.featureObservations
+        self.lidarSamples = f.lidarSamples
     }
 
     /// Frame with only the pose replaced (image and undistortion spec unchanged).
@@ -174,7 +211,8 @@ public struct CapturedFrame {
 /// - `sparsePoints`: BA-refined ORB points + raw ARKit points (only raw ARKit if BA was not run).
 /// - `baRefinedPoints`: only BA points that passed IGR verification. Excludes wide-area raw ARKit
 ///   points such as floor and walls. nil if BA was not run.
-/// - `lidarPoints`: world points unprojected from sceneDepth. Empty on devices without LiDAR.
+/// - `lidarPoints`: world points unprojected from sceneDepth with the capture-time ARKit poses. Only
+///   in datasets saved before the frames carried `lidarSamples`; empty otherwise.
 public struct CapturedScene {
     public let frames: [CapturedFrame]
     public let sparsePoints: [SIMD3<Float>]
@@ -202,6 +240,56 @@ public struct CapturedScene {
         CapturedScene(frames: frames, sparsePoints: sparsePoints, baRefinedPoints: baRefinedPoints,
                       lidarPoints: lidarPoints, diagnostics: diagnostics)
     }
+
+    /// A LiDAR sample in world coordinates with its fusion confidence, the depth it was seen at
+    /// and its color (0..1; mid-grey unless taken from the image).
+    public typealias WorldLiDARSample = (position: SIMD3<Float>, confidence: Float, depth: Float, color: SIMD3<Float>)
+
+    /// LiDAR samples in world coordinates, moved with each frame's current pose (the BA pose once
+    /// the scene is refined). Datasets saved before frames carried their samples fall back to
+    /// `lidarPoints` at medium confidence, seen from 1 m.
+    public var lidarWorldSamples: [WorldLiDARSample] { lidarWorldSamples(colors: false) }
+
+    /// `lidarWorldSamples`; with `colors`, each sample takes the color of the pixel it projects to
+    /// in its frame's image (reading every frame image once).
+    public func lidarWorldSamples(colors: Bool) -> [WorldLiDARSample] {
+        let grey = SIMD3<Float>(repeating: 0.5)
+        guard frames.contains(where: { !$0.lidarSamples.isEmpty }) else {
+            let medium = LiDARSample(cameraPoint: SIMD3(0, 0, 1), confidenceLevel: 1, depthSpread: 0)
+            return lidarPoints.map { ($0, medium.confidence(), 1, grey) }
+        }
+        var out: [WorldLiDARSample] = []
+        out.reserveCapacity(frames.reduce(0) { $0 + $1.lidarSamples.count })
+        for f in frames where !f.lidarSamples.isEmpty {
+            // viewmat = [R | t] (world → camera), so world = Rᵀ (p − t)
+            let v = f.viewmat
+            let rt = simd_float3x3(rows: [
+                SIMD3(v[0], v[4], v[8]), SIMD3(v[1], v[5], v[9]), SIMD3(v[2], v[6], v[10]),
+            ])
+            let t = SIMD3<Float>(v[3], v[7], v[11])
+            var rgb = [SIMD3<Float>](repeating: grey, count: f.lidarSamples.count)
+            if colors {
+                // Pixel each sample projects to with the frame's (undistorted) intrinsics.
+                let k = f.intrinsics
+                let pix = f.lidarSamples.map { s -> Int32 in
+                    let p = s.cameraPoint
+                    let u = Swift.min(f.width - 1, Swift.max(0, Int(k.fx * p.x / p.z + k.cx)))
+                    let vv = Swift.min(f.height - 1, Swift.max(0, Int(k.fy * p.y / p.z + k.cy)))
+                    return Int32(vv * f.width + u)
+                }
+                let img = f.image.reshaped([f.width * f.height, 3])
+                let picked = img.take(MLXArray(pix), axis: 0).asType(.float32).asArray(Float.self)
+                for i in 0..<rgb.count { rgb[i] = SIMD3(picked[i * 3], picked[i * 3 + 1], picked[i * 3 + 2]) / 255 }
+            }
+            for (i, s) in f.lidarSamples.enumerated() {
+                out.append((rt * (s.cameraPoint - t), s.confidence(), s.cameraPoint.z, rgb[i]))
+            }
+        }
+        return out
+    }
+
+    /// Positions of `lidarWorldSamples`.
+    public var lidarWorldPoints: [SIMD3<Float>] { lidarWorldSamples.map(\.position) }
 
     /// The saved dataset the frame images reload from (`CaptureDatasetStore.save` / `load`), nil
     /// while they exist only in memory.

@@ -48,6 +48,11 @@ func usage() {
     print("           0 = all frames)")
     print("         THERMAL_SIM=nominal|fair|serious fixes the thermal guard's thermalState (reproduces the serious slow-down)")
     print("         GEO_REG=0 turns off the geometric regularization (on as in the app)")
+    print("         POSE_SOURCE=arkit trains on the ARKit poses instead of the BA poses (BA still runs)")
+    print("         SEED_ALLOC=confidence keeps MVS or LiDAR per cell by confidence and caps per cell")
+    print("           (cells SEED_CELL_PX=<pixels across at the seen depth>, default 16; SEED_LIDAR_WEIGHT=<w>, default 1)")
+    print("         LIDAR_COLOR=0 leaves the LiDAR seed points mid-grey instead of colored from the images")
+    print("         LIDAR_SURFACE=0 lets pixels where LiDAR measured a surface count as background again")
     print("         MESH_OBJ=<path.obj> after training, builds the mesh as the app does after training: from the trained")
     print("           Gaussians' surface depth (from training's MVS depth with GEO_REG=0); MESH_VOXEL=<m> (default")
     print("           0.005) / MESH_TRUNC=<voxels> (default 4) / MESH_MIN_WEIGHT (default 3) /")
@@ -361,6 +366,9 @@ case "train-capture":
             // POSE_DUMP=<path.json> writes poses before and after BA (for evaluating pose
             // accuracy).
             poseDumpURL: env["POSE_DUMP"].map { URL(fileURLWithPath: $0) },
+            // POSE_SOURCE=arkit: MVS and training use the ARKit poses instead of the BA poses
+            // (BA still runs, for the frame set and lens undistortion).
+            revertToARKitPoses: env["POSE_SOURCE"]?.lowercased() == "arkit",
             log: logErr)
         let result = try CaptureTraining.train(
             geometry: geometry,
@@ -386,6 +394,18 @@ case "train-capture":
             trainingViewCap: env["VIEW_CAP"].flatMap { Int($0) },
             maxInitGaussians: env["INIT_CAP"].flatMap { Int($0) }
                 ?? CaptureTraining.AppPreset.initialGaussianCap(cap: capMax),
+            // SEED_ALLOC=confidence: per cell keep MVS or LiDAR by mean confidence and cap per cell
+            // (SEED_CELL_PX=<pixels across>, default 16; SEED_LIDAR_WEIGHT=<w>, default 1).
+            seedAllocation: env["SEED_ALLOC"]?.lowercased() == "confidence"
+                ? .confidence(cellPixels: env["SEED_CELL_PX"].flatMap { Float($0) } ?? 16,
+                              lidarWeight: env["SEED_LIDAR_WEIGHT"].flatMap { Float($0) } ?? 1)
+                : .even,
+            // LIDAR_COLOR=0: leave the LiDAR seed points mid-grey (colored from the images as in the
+            // app).
+            lidarColors: env["LIDAR_COLOR"] != "0",
+            // LIDAR_SURFACE=0: pixels where LiDAR measured a surface may be background again (they
+            // are kept out of the background mask as in the app).
+            lidarSurfaceMask: env["LIDAR_SURFACE"] != "0",
             // C2F=<fraction>: share of iterations at 1/C2F_FACTOR of the captured resolution.
             // FINE_RES=<num>/<den> | full: resolution of the rest. The defaults are the app's (0.5,
             // 1/3 and 2/3: the coarse phase is half the fine resolution); with FINE_RES the coarse

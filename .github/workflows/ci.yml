@@ -41,10 +41,16 @@ jobs:
           xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
           sudo xcode-select -s "$xcode"
           xcodebuild -version
+      # The runner image changes every week or two. A build cache made on an older image is mostly
+      # unusable on a newer one (a re-run on a newer image recompiled 326 steps instead of 127), and
+      # a cache that hit is never saved again, so the stale one would be restored for good. Putting
+      # the image version in the key makes each image get its own cache.
+      - id: image
+        run: echo "version=$ImageVersion" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         with:
           path: .build
-          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift') }}
+          key: spm-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('Package.swift') }}
           restore-keys: spm-${{ runner.os }}-
       - name: Build the Swift package
         run: swift build
@@ -54,7 +60,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: DerivedData
-          key: ios-${{ runner.os }}-${{ hashFiles('Package.swift') }}
+          key: ios-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('Package.swift') }}
           restore-keys: ios-${{ runner.os }}-
       - name: Build the iOS app for the simulator
         run: |

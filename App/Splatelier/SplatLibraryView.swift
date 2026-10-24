@@ -43,6 +43,7 @@ struct SplatLibraryView: View {
     @State private var renamingItem: CaptureItem?
     @State private var renameText = ""
     @State private var settingsSheet: SettingsSheetData?
+    @State private var shareRequest: ShareRequest?
     private let previewHeight: CGFloat = 156
 
     var body: some View {
@@ -74,6 +75,9 @@ struct SplatLibraryView: View {
         .safeAreaInset(edge: .bottom) { selectionBar }
         .onAppear(perform: reload)
         .refreshable { reload() }
+        .sheet(item: $shareRequest) { request in
+            ShareOptionsSheet(entries: request.entries)
+        }
         .fileImporter(
             isPresented: $importing,
             allowedContentTypes: importableTypes,
@@ -233,14 +237,11 @@ struct SplatLibraryView: View {
                 Label("View training settings", systemImage: "slider.horizontal.3")
             }
         }
-        // Only the deliverable GS (= main) PLY is shared; the mesh has its own entry.
-        ShareLink(item: item.mainURL) {
+        // Opens the sheet where the splats (and their format) and the mesh are chosen.
+        Button {
+            shareRequest = ShareRequest(entries: [shareEntry(for: item)])
+        } label: {
             Label("Share", systemImage: "square.and.arrow.up")
-        }
-        if let meshURL = item.meshURL {
-            ShareLink(item: meshURL) {
-                Label("Share mesh", systemImage: "cube")
-            }
         }
         Button(role: .destructive) {
             delete(item)
@@ -334,7 +335,9 @@ struct SplatLibraryView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer()
-                ShareLink(items: selectedMainURLs) {
+                Button {
+                    shareRequest = ShareRequest(entries: selectedItems.map(shareEntry(for:)))
+                } label: {
                     Label("Share", systemImage: "square.and.arrow.up")
                 }
                 .disabled(selection.isEmpty)
@@ -351,8 +354,12 @@ struct SplatLibraryView: View {
         }
     }
 
-    private var selectedMainURLs: [URL] {
-        items.filter { selection.contains($0.id) }.map(\.mainURL)
+    private var selectedItems: [CaptureItem] {
+        items.filter { selection.contains($0.id) }
+    }
+
+    private func shareEntry(for item: CaptureItem) -> ShareEntry {
+        ShareEntry(name: item.displayName, splatURL: item.mainURL, meshURL: item.meshURL)
     }
 
     private func toggleSelectMode() {

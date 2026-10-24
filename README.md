@@ -208,6 +208,8 @@ Main papers:
 | Census transform | Zabih & Woodfill 1994; Fife & Archibald 2013 |
 | Stereo confidence measures | Hu & Mordohai 2012 |
 | Bundle adjustment | Triggs et al. 2000; Solà et al. 2018 |
+| Square-root bundle adjustment (point elimination by QR) | Demmel et al. 2021, CVPR |
+| Shifted CholeskyQR | Fukaya et al. 2020, SIAM J. Sci. Comput. |
 | FAST, BRIEF, ORB | Rosten & Drummond 2006; Calonder et al. 2010; Rublee et al. 2011 |
 | Ratio test | Lowe 2004 |
 | Similarity transform alignment | Umeyama 1991 |

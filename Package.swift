@@ -55,6 +55,11 @@ let package = Package(
             ],
             resources: [
                 .copy("Resources/Slang"),
+            ],
+            swiftSettings: [
+                // Accelerate's current LAPACK interface. The legacy CLAPACK entry points
+                // (`sposv_` without it) overrun the heap in BA's dense solve on macOS 27.
+                .unsafeFlags(["-Xcc", "-DACCELERATE_NEW_LAPACK"]),
             ]
         ),
         .executableTarget(
@@ -93,7 +98,8 @@ let package = Package(
         ),
         .testTarget(
             name: "TrainerTests",
-            dependencies: ["Trainer"]
+            dependencies: ["Trainer"],
+            swiftSettings: [.unsafeFlags(["-Xcc", "-DACCELERATE_NEW_LAPACK"])]
         ),
         .testTarget(
             name: "CaptureTests",

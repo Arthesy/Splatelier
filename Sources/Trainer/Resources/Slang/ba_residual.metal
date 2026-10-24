@@ -12,10 +12,11 @@ struct KernelContext_0
     float device* viewmats_0;
     float device* z_cam_0;
     float device* residuals_0;
+    float device* res_params_0;
     float device* obs_pixels_0;
 };
 
-[[kernel]] void ba_residual(uint3 tid_0 [[thread_position_in_grid]], int device* res_dims_1 [[buffer(6)]], int device* obs_cam_idx_1 [[buffer(3)]], int device* obs_pt_idx_1 [[buffer(4)]], float device* intrinsics_buf_1 [[buffer(1)]], float device* points_1 [[buffer(2)]], float device* viewmats_1 [[buffer(0)]], float device* z_cam_1 [[buffer(8)]], float device* residuals_1 [[buffer(7)]], float device* obs_pixels_1 [[buffer(5)]])
+[[kernel]] void ba_residual(uint3 tid_0 [[thread_position_in_grid]], int device* res_dims_1 [[buffer(7)]], int device* obs_cam_idx_1 [[buffer(3)]], int device* obs_pt_idx_1 [[buffer(4)]], float device* intrinsics_buf_1 [[buffer(1)]], float device* points_1 [[buffer(2)]], float device* viewmats_1 [[buffer(0)]], float device* z_cam_1 [[buffer(9)]], float device* residuals_1 [[buffer(8)]], float device* res_params_1 [[buffer(6)]], float device* obs_pixels_1 [[buffer(5)]])
 {
     thread KernelContext_0 kernelContext_0;
     (&kernelContext_0)->res_dims_0 = res_dims_1;
@@ -26,6 +27,7 @@ struct KernelContext_0
     (&kernelContext_0)->viewmats_0 = viewmats_1;
     (&kernelContext_0)->z_cam_0 = z_cam_1;
     (&kernelContext_0)->residuals_0 = residuals_1;
+    (&kernelContext_0)->res_params_0 = res_params_1;
     (&kernelContext_0)->obs_pixels_0 = obs_pixels_1;
     int i_0 = int(tid_0.x);
     if(i_0 >= res_dims_1[int(0)])
@@ -55,9 +57,13 @@ struct KernelContext_0
         return;
     }
     float invZ_0 = 1.0 / zc_0;
-    float predV_0 = fy_0 * yc_0 * invZ_0 + cy_0;
+    float nx_0 = xc_0 * invZ_0;
+    float ny_0 = yc_0 * invZ_0;
+    float r2_0 = nx_0 * nx_0 + ny_0 * ny_0;
+    float f_0 = 1.0 + (&kernelContext_0)->res_params_0[int(0)] * r2_0 + (&kernelContext_0)->res_params_0[int(1)] * r2_0 * r2_0;
+    float predV_0 = fy_0 * f_0 * ny_0 + cy_0;
     int _S2 = i_0 * int(2);
-    *((&kernelContext_0)->residuals_0+_S2) = fx_0 * xc_0 * invZ_0 + cx_0 - (&kernelContext_0)->obs_pixels_0[_S2];
+    *((&kernelContext_0)->residuals_0+_S2) = fx_0 * f_0 * nx_0 + cx_0 - (&kernelContext_0)->obs_pixels_0[_S2];
     int _S3 = _S2 + int(1);
     *((&kernelContext_0)->residuals_0+_S3) = predV_0 - (&kernelContext_0)->obs_pixels_0[_S3];
     return;

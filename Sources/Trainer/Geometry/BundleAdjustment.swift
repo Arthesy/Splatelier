@@ -4,15 +4,16 @@
 // Bundle Adjustment (PocketGS Operator G 3c, Sec. III-A 2). GN / LM + Huber + scale-aware gauge.
 // Reference: Triggs et al. 2000, "Bundle Adjustment — A Modern Synthesis".
 //
-// Schur complement (Triggs sec. 4.3 / PocketGS eq. 3). H_pp is block-diagonal with per-point 3×3
-// blocks:
-//   (H_tt - H_tp H_pp⁻¹ H_tpᵀ) δ_cam = b_t - H_tp H_pp⁻¹ b_p
-//   δ_pt_j = H_pp_j⁻¹ (b_p_j - Σ_i H_tp_{ij}ᵀ δ_cam_i)
-// Pose update is a left perturbation T ← exp([δ_rot, δ_trans]) · T (small-step approximation, Sola
-// 2018 eq. 95-102).
+// The points are eliminated (Schur complement, Triggs sec. 4.3 / PocketGS eq. 3) by a per-point QR
+// of the point Jacobian as in square-root BA (Demmel et al. 2021), which keeps the reduced camera
+// system positive definite in float32; see slang/ba_point_qr.slang. The projection includes radial
+// distortion (k1, k2) shared by all cameras, which BA can estimate with the poses and points
+// (self-calibration, as COLMAP refines a camera's extra parameters). Pose update is a left
+// perturbation T ← exp([δ_rot, δ_trans]) · T (small-step approximation, Sola 2018 eq. 95-102).
 
 import Foundation
 import simd
+import Accelerate
 import MLX
 import MLXFast
 
@@ -31,13 +32,17 @@ public enum BundleAdjustment {
         }
     }
 
-    /// viewmats are row-major 4×4 world→camera; points are in world coordinates.
+    /// viewmats are row-major 4×4 world→camera; points are in world coordinates. `distortion` is
+    /// the radial distortion of all cameras (observations are distorted pixels; `.none` is
+    /// pinhole).
     public struct State: Sendable {
         public var viewmats: [[Float]]
         public var points: [SIMD3<Float>]
-        public init(viewmats: [[Float]], points: [SIMD3<Float>]) {
+        public var distortion: RadialDistortion
+        public init(viewmats: [[Float]], points: [SIMD3<Float>], distortion: RadialDistortion = .none) {
             self.viewmats = viewmats
             self.points = points
+            self.distortion = distortion
         }
     }
 
@@ -73,6 +78,9 @@ public enum BundleAdjustment {
         public var priorRotationSigmaDeg: Float? = nil
         public var priorPositionSigma: Float? = nil
         public var priorPixelSigma: Float = 1.0
+        /// Estimate `State.distortion` (k1, k2) together with the poses and points. Otherwise it
+        /// stays fixed (still used in the projection).
+        public var estimateDistortion: Bool = false
 
         public enum DampingMode: Sendable { case absolute, marquardt }
 
@@ -86,7 +94,8 @@ public enum BundleAdjustment {
             adaptiveLM: Bool = false,
             dampingMode: DampingMode = .absolute,
             priorRotationSigmaDeg: Float? = nil,
-            priorPositionSigma: Float? = nil
+            priorPositionSigma: Float? = nil,
+            estimateDistortion: Bool = false
         ) {
             precondition(iterations > 0)
             precondition(lmInitialDamping >= 0)
@@ -101,6 +110,7 @@ public enum BundleAdjustment {
             self.dampingMode = dampingMode
             self.priorRotationSigmaDeg = priorRotationSigmaDeg
             self.priorPositionSigma = priorPositionSigma
+            self.estimateDistortion = estimateDistortion
         }
     }
 
@@ -109,7 +119,8 @@ public enum BundleAdjustment {
         public let residualNorms: [Float]   // RMS residual (px): initial + after each iteration
     }
 
-    /// Takes `parameters.iterations` GN / LM steps. Intrinsics are fixed.
+    /// Takes `parameters.iterations` GN / LM steps. Intrinsics are fixed; the distortion is
+    /// estimated if `parameters.estimateDistortion`.
     public static func refine(
         state: State,
         intrinsics: [Intrinsics],
@@ -127,6 +138,7 @@ public enum BundleAdjustment {
         residualNorms.append(residualNorm(state: current, intrinsics: intrinsics, observations: observations))
         let marquardt = parameters.dampingMode == .marquardt
         let prior = PosePrior(parameters: parameters, viewmats: priorViewmats)
+        let layout = ObservationLayout(intrinsics: intrinsics, observations: observations, nPt: state.points.count)
         var currentCost = marquardt
             ? robustCost(state: current, intrinsics: intrinsics, observations: observations,
                          huberThreshold: parameters.huberThreshold) + (prior?.cost(current) ?? 0)
@@ -135,11 +147,13 @@ public enum BundleAdjustment {
             let candidate = singleGaussNewtonStep(
                 state: current, intrinsics: intrinsics,
                 observations: observations,
+                layout: layout,
                 freezeFirstCamera: parameters.freezeFirstCamera,
                 scaleAwareGauge: parameters.scaleAwareGauge,
                 huberThreshold: parameters.huberThreshold,
                 lmDamping: lambda,
                 dampingMode: parameters.dampingMode,
+                estimateDistortion: parameters.estimateDistortion,
                 prior: prior
             )
             if marquardt && parameters.adaptiveLM {
@@ -182,130 +196,98 @@ public enum BundleAdjustment {
 
     // MARK: - Internals
 
-    /// One GN / LM step. Solves the reduced camera system via the Schur complement and updates the
-    /// state.
+    /// Below this many points the elimination runs on the CPU in double precision (same algorithm
+    /// as the GPU kernels); the GPU launch overhead does not pay off for small problems.
+    static let gpuMinPoints = 1000
+
+    /// One GN / LM step. Eliminates the points per point by QR (slang/ba_point_qr.slang), solves
+    /// the reduced system over the free cameras (and k1, k2 when `estimateDistortion`), and
+    /// back-substitutes the points.
     static func singleGaussNewtonStep(
         state: State,
         intrinsics: [Intrinsics],
         observations: [Observation],
+        layout: ObservationLayout? = nil,
         freezeFirstCamera: Bool,
         scaleAwareGauge: Bool = false,
         huberThreshold: Float? = nil,
         lmDamping: Float = 0,
         dampingMode: Parameters.DampingMode = .absolute,
+        estimateDistortion: Bool = false,
         prior: PosePrior? = nil
     ) -> State {
         let nCam = state.viewmats.count
         let nPt = state.points.count
         let firstFree = freezeFirstCamera ? 1 : 0
         let nFree = nCam - firstFree
-        guard nFree > 0 else { return state }
+        guard nFree > 0 || estimateDistortion else { return state }
+        let layout = layout ?? ObservationLayout(intrinsics: intrinsics, observations: observations, nPt: nPt)
+        let marquardt = dampingMode == .marquardt && lmDamping > 0
+        let D = 6 * nFree + (estimateDistortion ? 2 : 0)
+        let kOff = 6 * nFree
 
-        // --- 1. Build H and b on the GPU ---
-        // H_tt [nCam][6×6] (block-diagonal), H_pp [nPt][3×3], b_t [nCam][6], b_p [nPt][3],
-        // H_tp is a 6×3 block per observation (htpBlocks).
-        var Htt: [Float]
-        var Hpp: [Float]
-        var bt: [Float]
-        var bp: [Float]
-        var htpBlocks: [HtpBlock]
-        (Htt, Hpp, bt, bp, htpBlocks) = computeJacobianAndAccumulateGPU(
-            state: state, intrinsics: intrinsics,
-            observations: observations, huberThreshold: huberThreshold,
-            nCam: nCam, nPt: nPt
-        )
-        // Prior-pose constraint (camera blocks only).
-        if let prior { prior.accumulate(state: state, Htt: &Htt, bt: &bt, skipFirst: freezeFirstCamera) }
-        // Marquardt damping: scale the diagonals of H_tt and H_pp by (1+λ). Applying it on the
-        // point side too keeps the inverse of low-parallax points (H_pp nearly singular) from
-        // blowing up. Components with a zero diagonal (cameras without observations, etc.) get a
-        // small floor to stay non-singular.
-        if dampingMode == .marquardt && lmDamping > 0 {
-            let s = 1 + lmDamping
-            for c in 0..<nCam {
-                for r in 0..<6 {
-                    let k = c * 36 + r * 7
-                    Htt[k] = Htt[k] * s + 1e-9
-                }
-            }
-            for j in 0..<nPt {
-                for r in 0..<3 {
-                    let k = j * 9 + r * 4
-                    Hpp[k] = Hpp[k] * s + 1e-9
-                }
-            }
-        }
-
-        // --- 2. H_pp⁻¹ + Schur reduction --- On the GPU, differing atomic-add order causes
-        // cancellation in small systems (breaks tests with few points). Use the GPU only when there
-        // are enough points, otherwise the CPU.
-        let D = 6 * nFree
-        let GPU_SCHUR_NPT_THRESHOLD = 1000
-        var redLHSMut: [Float]
-        var redRHSMut: [Float]
-        var HppInv: [Float]
-        if nPt >= GPU_SCHUR_NPT_THRESHOLD {
-            (redLHSMut, redRHSMut, HppInv) = runHppInvertAndSchurGPU(
-                Hpp: Hpp, bp: bp, Htt: Htt, bt: bt, htpBlocks: htpBlocks,
-                nCam: nCam, nPt: nPt, nFree: nFree, firstFree: firstFree
-            )
+        // --- 1. Linearize and eliminate the points (Marquardt damps the point blocks too, which
+        // keeps low-parallax points from blowing up) ---
+        let pointDamping = marquardt ? lmDamping : 0
+        var system: ReducedSystem
+        var gpu: (lin: MLXArray, pdata: MLXArray)?
+        var cpu: (lin: [Double], pdata: [Double])?
+        if nPt >= gpuMinPoints {
+            let r = reduceGPU(state: state, layout: layout, huberThreshold: huberThreshold,
+                              pointDamping: pointDamping, firstFree: firstFree,
+                              estimateDistortion: estimateDistortion)
+            system = r.system
+            gpu = (r.lin, r.pdata)
         } else {
-            HppInv = [Float](repeating: 0, count: nPt * 9)
-            for j in 0..<nPt {
-                invert3x3(
-                    a: Array(Hpp[(j * 9)..<((j + 1) * 9)]),
-                    into: &HppInv, offset: j * 9
-                )
-            }
-            redLHSMut = [Float](repeating: 0, count: D * D)
-            redRHSMut = [Float](repeating: 0, count: D)
-            for camI in firstFree..<nCam {
-                let fI = camI - firstFree
-                for r in 0..<6 {
-                    redRHSMut[fI * 6 + r] = bt[camI * 6 + r]
-                    for c in 0..<6 {
-                        redLHSMut[(fI * 6 + r) * D + (fI * 6 + c)] = Htt[camI * 36 + r * 6 + c]
-                    }
-                }
-            }
-            cpuSchurReduce(
-                redLHS: &redLHSMut, redRHS: &redRHSMut,
-                HppInv: HppInv, bp: bp, htpBlocks: htpBlocks,
-                D: D, nPt: nPt, firstFree: firstFree, freezeFirstCamera: freezeFirstCamera
-            )
-        }
-        // Per-point htpBlocks indices (for CPU back-substitution)
-        var byPoint: [[Int]] = Array(repeating: [], count: nPt)
-        for (idx, b) in htpBlocks.enumerated() {
-            byPoint[b.pt].append(idx)
+            let lin = linearizeCPU(state: state, intrinsics: intrinsics, layout: layout, huberThreshold: huberThreshold)
+            let pdata = pointQRCPU(lin: lin, layout: layout, lambda: Double(pointDamping))
+            system = pointReduceCPU(lin: lin, pdata: pdata, layout: layout, firstFree: firstFree,
+                                    estimateDistortion: estimateDistortion)
+            cpu = (lin, pdata)
         }
 
-        // --- 3. LM damping: (H + λI) δ = -Jᵀ r (Triggs sec. 4.4) ---
-        if dampingMode == .absolute && lmDamping > 0 {
-            for i in 0..<D {
-                redLHSMut[i * D + i] += lmDamping
-            }
-        }
-
-        // --- 4. Solve the reduced system (D×D is a few hundred, so CPU stream) ---
-        let reducedLHSArr = MLXArray(redLHSMut, [D, D])
-        let reducedRHSArr = MLXArray(redRHSMut, [D, 1])
-        let solution = MLX.solve(reducedLHSArr, reducedRHSArr, stream: .cpu)
-        let deltaCamFlat = solution.asArray(Float.self)
-
-        // δ_cam of fixed cameras is 0
-        var deltaCam = [Float](repeating: 0, count: nCam * 6)
+        // --- 2. Prior-pose constraint and damping on the reduced diagonal ---
+        var priorDiag = [Float](repeating: 0, count: nCam * 6)
+        prior?.accumulate(state: state, lhs: &system.lhs, rhs: &system.rhs, dimension: D,
+                          firstFree: firstFree, diagonal: &priorDiag)
         for camI in firstFree..<nCam {
             let fI = camI - firstFree
             for r in 0..<6 {
-                deltaCam[camI * 6 + r] = deltaCamFlat[fI * 6 + r]
+                let i = (fI * 6 + r) * (D + 1)
+                if marquardt {
+                    // Marquardt: scale the undamped diagonal by (1+λ); a small floor keeps
+                    // unobserved components non-singular.
+                    system.lhs[i] += lmDamping * (system.camDiag[camI * 6 + r] + priorDiag[camI * 6 + r]) + 1e-9
+                } else if lmDamping > 0 {
+                    system.lhs[i] += lmDamping
+                }
+            }
+        }
+        if estimateDistortion {
+            for a in 0..<2 {
+                let i = (kOff + a) * (D + 1)
+                if marquardt {
+                    system.lhs[i] += lmDamping * system.kDiag[a] + 1e-9
+                } else if lmDamping > 0 {
+                    system.lhs[i] += lmDamping
+                }
             }
         }
 
-        // --- 5. Scale-aware gauge: remove the baseline-axis component from camera 1's translation
+        // --- 3. Solve the reduced system (D = 6 × free cameras (+2), ~3600 for 600 frames) ---
+        let solution = D > 0 ? solveReducedSystem(lhs: system.lhs, rhs: system.rhs, dimension: D) : []
+
+        var deltaCam = [Float](repeating: 0, count: nCam * 6)
+        for camI in firstFree..<nCam {
+            let fI = camI - firstFree
+            for r in 0..<6 { deltaCam[camI * 6 + r] = solution[fI * 6 + r] }
+        }
+        let deltaK = estimateDistortion ? SIMD2(solution[kOff], solution[kOff + 1]) : SIMD2<Float>(0, 0)
+
+        // --- 4. Scale-aware gauge: remove the baseline-axis component from camera 1's translation
         // update --- The baseline is in world coordinates but δ_cam's translation (v of the left
         // perturbation) is in camera 1 coordinates, so rotate the baseline by camera 1's rotation
-        // before the dot product.
+        // before the dot product. (The points are back-substituted with the projected update.)
         if scaleAwareGauge && freezeFirstCamera && nCam >= 2 {
             let c0 = FrameSubsampler.cameraCenter(viewmat: state.viewmats[0])
             let c1 = FrameSubsampler.cameraCenter(viewmat: state.viewmats[1])
@@ -330,37 +312,19 @@ public enum BundleAdjustment {
             }
         }
 
-        // --- 6. Back-substitute δ_pt (GPU / CPU with the same threshold as Schur) ---
+        // --- 5. Back-substitute the points ---
         let deltaPt: [Float]
-        if nPt >= GPU_SCHUR_NPT_THRESHOLD {
-            deltaPt = runBackSubstituteGPU(
-                HppInv: HppInv, bp: bp, htpBlocks: htpBlocks,
-                deltaCam: deltaCam, nCam: nCam, nPt: nPt
-            )
+        if let gpu {
+            deltaPt = backSubstituteGPU(lin: gpu.lin, pdata: gpu.pdata, layout: layout,
+                                        deltaCam: deltaCam, deltaK: deltaK)
+        } else if let cpu {
+            deltaPt = backSubstituteCPU(lin: cpu.lin, pdata: cpu.pdata, layout: layout,
+                                        deltaCam: deltaCam, deltaK: deltaK)
         } else {
-            var deltaPtMut = [Float](repeating: 0, count: nPt * 3)
-            for j in 0..<nPt {
-                let attachedIndices = byPoint[j]
-                if attachedIndices.isEmpty { continue }
-                var rhs = SIMD3<Float>(bp[j * 3 + 0], bp[j * 3 + 1], bp[j * 3 + 2])
-                for idx in attachedIndices {
-                    let b = htpBlocks[idx]
-                    let dc = SIMD6Floats(
-                        deltaCam[b.cam * 6 + 0], deltaCam[b.cam * 6 + 1],
-                        deltaCam[b.cam * 6 + 2], deltaCam[b.cam * 6 + 3],
-                        deltaCam[b.cam * 6 + 4], deltaCam[b.cam * 6 + 5]
-                    )
-                    rhs -= matVec3x6Transpose(m6x3: b.m, v6: dc)
-                }
-                let delta = matVec3x3(matrixOffset: j * 9, m: HppInv, v: rhs)
-                deltaPtMut[j * 3 + 0] = delta.x
-                deltaPtMut[j * 3 + 1] = delta.y
-                deltaPtMut[j * 3 + 2] = delta.z
-            }
-            deltaPt = deltaPtMut
+            deltaPt = [Float](repeating: 0, count: nPt * 3)
         }
 
-        // --- 7. Update state ---
+        // --- 6. Update state ---
         var newViewmats = state.viewmats
         for camI in 0..<nCam {
             let omega = SIMD3<Float>(
@@ -379,47 +343,29 @@ public enum BundleAdjustment {
             newPoints[j].y += deltaPt[j * 3 + 1]
             newPoints[j].z += deltaPt[j * 3 + 2]
         }
-        return State(viewmats: newViewmats, points: newPoints)
+        var distortion = state.distortion
+        distortion.k1 += deltaK.x
+        distortion.k2 += deltaK.y
+        return State(viewmats: newViewmats, points: newPoints, distortion: distortion)
     }
 
-    /// CPU Schur reduction for small systems. Assumes redLHS / redRHS are initialized with the H_tt
-    /// diagonal blocks + b_t.
-    static func cpuSchurReduce(
-        redLHS: inout [Float], redRHS: inout [Float],
-        HppInv: [Float], bp: [Float],
-        htpBlocks: [HtpBlock],
-        D: Int, nPt: Int, firstFree: Int, freezeFirstCamera: Bool
-    ) {
-        var byPoint: [[Int]] = Array(repeating: [], count: nPt)
-        for (idx, b) in htpBlocks.enumerated() {
-            byPoint[b.pt].append(idx)
-        }
-        for j in 0..<nPt {
-            let attachedIndices = byPoint[j]
-            if attachedIndices.isEmpty { continue }
-            let invBase = j * 9
-            let bp_j = SIMD3<Float>(bp[j * 3 + 0], bp[j * 3 + 1], bp[j * 3 + 2])
-            let HppInvbp = matVec3x3(matrixOffset: invBase, m: HppInv, v: bp_j)
-            for idx in attachedIndices {
-                let b = htpBlocks[idx]
-                if freezeFirstCamera && b.cam == 0 { continue }
-                let fI = b.cam - firstFree
-                let contribRHS = matVec6x3(m6x3: b.m, v: HppInvbp)
-                for r in 0..<6 { redRHS[fI * 6 + r] -= contribRHS[r] }
-                for idx2 in attachedIndices {
-                    let b2 = htpBlocks[idx2]
-                    if freezeFirstCamera && b2.cam == 0 { continue }
-                    let fK = b2.cam - firstFree
-                    let HppInvHtpkT = matMul3x3_3x6T(matrixOffset: invBase, m: HppInv, n6x3: b2.m)
-                    let M = matMul6x3_3x6(a6x3: b.m, b3x6: HppInvHtpkT)
-                    for r in 0..<6 {
-                        for c in 0..<6 {
-                            redLHS[(fI * 6 + r) * D + (fK * 6 + c)] -= M[r * 6 + c]
-                        }
-                    }
-                }
-            }
-        }
+    /// Solves the reduced camera system `lhs · x = rhs` (`lhs` row-major `dimension²`) with
+    /// Accelerate's LAPACK. The Schur complement of the damped H is symmetric positive definite, so
+    /// Cholesky (sposv) solves it, ~10× faster than MLX's CPU LU at 3600 unknowns. If float32
+    /// accumulation made it lose definiteness, falls back to LU (sgesv). The matrix is symmetric,
+    /// so LAPACK's column-major view of the row-major buffer is the same matrix.
+    static func solveReducedSystem(lhs: [Float], rhs: [Float], dimension: Int) -> [Float] {
+        var n = __LAPACK_int(dimension), lda = n, ldb = n, nrhs = __LAPACK_int(1)
+        var info = __LAPACK_int(0)
+        var uplo = Int8(UInt8(ascii: "U"))
+        var a = lhs, x = rhs
+        sposv_(&uplo, &n, &nrhs, &a, &lda, &x, &ldb, &info)
+        if info == 0 { return x }
+        a = lhs
+        x = rhs
+        var ipiv = [__LAPACK_int](repeating: 0, count: dimension)
+        sgesv_(&n, &nrhs, &a, &lda, &ipiv, &x, &ldb, &info)
+        return x
     }
 
     // MARK: - Cost
@@ -500,18 +446,24 @@ public enum BundleAdjustment {
             return Float(c)
         }
 
-        func accumulate(state: State, Htt: inout [Float], bt: inout [Float], skipFirst: Bool) {
-            for (i, v) in state.viewmats.enumerated() where !(skipFirst && i == 0) {
+        /// Adds the prior to the reduced system's free-camera blocks (`firstFree` fixed cameras get
+        /// no rows) and its diagonal to `diagonal` (nCam × 6, for Marquardt damping).
+        func accumulate(state: State, lhs: inout [Float], rhs: inout [Float], dimension D: Int,
+                        firstFree: Int, diagonal: inout [Float]) {
+            for (i, v) in state.viewmats.enumerated() where i >= firstFree {
+                let f = (i - firstFree) * 6
                 let R = PosePrior.rot(v)
                 let eR = PosePrior.logSO3(priorR[i].transpose * R)
                 let eO = PosePrior.center(v) - priorO[i]
                 let bw = -(R * eR) * wRot
                 let bv = (R * eO) * wPos
                 for k in 0..<3 {
-                    Htt[i * 36 + k * 7] += Float(wRot)
-                    Htt[i * 36 + (k + 3) * 7] += Float(wPos)
-                    bt[i * 6 + k] += Float(bw[k])
-                    bt[i * 6 + 3 + k] += Float(bv[k])
+                    lhs[(f + k) * (D + 1)] += Float(wRot)
+                    lhs[(f + 3 + k) * (D + 1)] += Float(wPos)
+                    diagonal[i * 6 + k] += Float(wRot)
+                    diagonal[i * 6 + 3 + k] += Float(wPos)
+                    rhs[f + k] += Float(bw[k])
+                    rhs[f + 3 + k] += Float(bv[k])
                 }
             }
         }

@@ -73,7 +73,7 @@
             }
         },
         {
-            "name": "jac_params",
+            "name": "lin_params",
             "binding": {"kind": "constantBuffer", "index": 6},
             "type": {
                 "kind": "resource",
@@ -85,7 +85,7 @@
             }
         },
         {
-            "name": "jac_dims",
+            "name": "lin_dims",
             "binding": {"kind": "constantBuffer", "index": 7},
             "type": {
                 "kind": "resource",
@@ -97,7 +97,7 @@
             }
         },
         {
-            "name": "Htt",
+            "name": "lin",
             "binding": {"kind": "constantBuffer", "index": 8},
             "type": {
                 "kind": "resource",
@@ -108,76 +108,11 @@
                     "scalarType": "float32"
                 }
             }
-        },
-        {
-            "name": "Hpp",
-            "binding": {"kind": "constantBuffer", "index": 9},
-            "type": {
-                "kind": "resource",
-                "baseShape": "structuredBuffer",
-                "access": "readWrite",
-                "resultType": {
-                    "kind": "scalar",
-                    "scalarType": "float32"
-                }
-            }
-        },
-        {
-            "name": "bt",
-            "binding": {"kind": "constantBuffer", "index": 10},
-            "type": {
-                "kind": "resource",
-                "baseShape": "structuredBuffer",
-                "access": "readWrite",
-                "resultType": {
-                    "kind": "scalar",
-                    "scalarType": "float32"
-                }
-            }
-        },
-        {
-            "name": "bp",
-            "binding": {"kind": "constantBuffer", "index": 11},
-            "type": {
-                "kind": "resource",
-                "baseShape": "structuredBuffer",
-                "access": "readWrite",
-                "resultType": {
-                    "kind": "scalar",
-                    "scalarType": "float32"
-                }
-            }
-        },
-        {
-            "name": "Htp_blocks",
-            "binding": {"kind": "constantBuffer", "index": 12},
-            "type": {
-                "kind": "resource",
-                "baseShape": "structuredBuffer",
-                "access": "readWrite",
-                "resultType": {
-                    "kind": "scalar",
-                    "scalarType": "float32"
-                }
-            }
-        },
-        {
-            "name": "Htp_valid",
-            "binding": {"kind": "constantBuffer", "index": 13},
-            "type": {
-                "kind": "resource",
-                "baseShape": "structuredBuffer",
-                "access": "readWrite",
-                "resultType": {
-                    "kind": "scalar",
-                    "scalarType": "int32"
-                }
-            }
         }
     ],
     "entryPoints": [
         {
-            "name": "ba_jacobian_accumulate",
+            "name": "ba_linearize",
             "stage": "compute",
             "parameters": [
                 {
@@ -220,36 +155,16 @@
                     "binding": {"kind": "constantBuffer", "index": 5, "used": 1}
                 },
                 {
-                    "name": "jac_params",
+                    "name": "lin_params",
                     "binding": {"kind": "constantBuffer", "index": 6, "used": 1}
                 },
                 {
-                    "name": "jac_dims",
+                    "name": "lin_dims",
                     "binding": {"kind": "constantBuffer", "index": 7, "used": 1}
                 },
                 {
-                    "name": "Htt",
+                    "name": "lin",
                     "binding": {"kind": "constantBuffer", "index": 8, "used": 1}
-                },
-                {
-                    "name": "Hpp",
-                    "binding": {"kind": "constantBuffer", "index": 9, "used": 1}
-                },
-                {
-                    "name": "bt",
-                    "binding": {"kind": "constantBuffer", "index": 10, "used": 1}
-                },
-                {
-                    "name": "bp",
-                    "binding": {"kind": "constantBuffer", "index": 11, "used": 1}
-                },
-                {
-                    "name": "Htp_blocks",
-                    "binding": {"kind": "constantBuffer", "index": 12, "used": 1}
-                },
-                {
-                    "name": "Htp_valid",
-                    "binding": {"kind": "constantBuffer", "index": 13, "used": 1}
                 }
             ]
         }

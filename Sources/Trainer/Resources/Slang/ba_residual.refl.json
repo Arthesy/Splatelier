@@ -73,8 +73,20 @@
             }
         },
         {
-            "name": "res_dims",
+            "name": "res_params",
             "binding": {"kind": "constantBuffer", "index": 6},
+            "type": {
+                "kind": "resource",
+                "baseShape": "structuredBuffer",
+                "resultType": {
+                    "kind": "scalar",
+                    "scalarType": "float32"
+                }
+            }
+        },
+        {
+            "name": "res_dims",
+            "binding": {"kind": "constantBuffer", "index": 7},
             "type": {
                 "kind": "resource",
                 "baseShape": "structuredBuffer",
@@ -86,7 +98,7 @@
         },
         {
             "name": "residuals",
-            "binding": {"kind": "constantBuffer", "index": 7},
+            "binding": {"kind": "constantBuffer", "index": 8},
             "type": {
                 "kind": "resource",
                 "baseShape": "structuredBuffer",
@@ -99,7 +111,7 @@
         },
         {
             "name": "z_cam",
-            "binding": {"kind": "constantBuffer", "index": 8},
+            "binding": {"kind": "constantBuffer", "index": 9},
             "type": {
                 "kind": "resource",
                 "baseShape": "structuredBuffer",
@@ -156,16 +168,20 @@
                     "binding": {"kind": "constantBuffer", "index": 5, "used": 1}
                 },
                 {
-                    "name": "res_dims",
+                    "name": "res_params",
                     "binding": {"kind": "constantBuffer", "index": 6, "used": 1}
                 },
                 {
-                    "name": "residuals",
+                    "name": "res_dims",
                     "binding": {"kind": "constantBuffer", "index": 7, "used": 1}
                 },
                 {
-                    "name": "z_cam",
+                    "name": "residuals",
                     "binding": {"kind": "constantBuffer", "index": 8, "used": 1}
+                },
+                {
+                    "name": "z_cam",
+                    "binding": {"kind": "constantBuffer", "index": 9, "used": 1}
                 }
             ]
         }

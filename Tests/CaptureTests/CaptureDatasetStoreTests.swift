@@ -107,6 +107,50 @@ func datasetStoreRoundTripsFeatureObservations() throws {
 }
 
 @Test
+func datasetStoreRoundTripsLiDARSamplesAndMovesThemWithThePose() throws {
+    // Per-frame LiDAR samples round-trip, and lidarWorldPoints moves them with each frame's
+    // current pose, so a pose change (BA) moves them too.
+    let base = datasetFrame(index: 0, width: 4, height: 4)
+    let samples = [LiDARSample(cameraPoint: SIMD3(0.1, -0.2, 1.5), confidenceLevel: 2, depthSpread: 0.01),
+                   LiDARSample(cameraPoint: SIMD3(-0.3, 0.4, 2.25), confidenceLevel: 1, depthSpread: 0)]
+    let withLiDAR = CapturedFrame(
+        image: base.image, viewmat: base.viewmat, intrinsics: base.intrinsics,
+        width: base.width, height: base.height, timestamp: base.timestamp,
+        anchorIdentifier: base.anchorIdentifier, lidarSamples: samples
+    )
+    let scene = CapturedScene(
+        frames: [withLiDAR, datasetFrame(index: 1, width: 4, height: 4)], sparsePoints: []
+    )
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dataset_lidar_\(UUID().uuidString)")
+    let dir = root.appendingPathComponent("capture_test.dataset")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try CaptureDatasetStore.save(scene, to: dir)
+    let loaded = try CaptureDatasetStore.load(from: dir)
+    #expect(loaded.frames[0].lidarSamples == samples)
+    #expect(loaded.frames[1].lidarSamples.isEmpty)
+
+    // 90° about +Y, then translation: world = Rᵀ (p − t) inverts p = R·world + t.
+    let world = SIMD3<Float>(0.5, -0.25, 2)
+    let R = simd_float3x3(rows: [SIMD3(0, 0, -1), SIMD3(0, 1, 0), SIMD3(1, 0, 0)])
+    let t = SIMD3<Float>(0.1, 0.2, 0.3)
+    let p = R * world + t
+    let moved = loaded.withFrames([CapturedFrame(
+        image: base.image,
+        viewmat: [0, 0, -1, t.x, 0, 1, 0, t.y, 1, 0, 0, t.z, 0, 0, 0, 1],
+        intrinsics: base.intrinsics, width: base.width, height: base.height,
+        timestamp: base.timestamp,
+        lidarSamples: [LiDARSample(cameraPoint: p, confidenceLevel: 2, depthSpread: 0)]
+    )])
+    #expect(simd_distance(moved.lidarWorldPoints[0], world) < 1e-5)
+
+    // Old datasets without per-frame samples fall back to the scene's world points.
+    let old = CapturedScene(frames: [base], sparsePoints: [], lidarPoints: [world])
+    #expect(old.lidarWorldPoints == [world])
+}
+
+@Test
 func datasetStoreSaveIsAtomic() throws {
     // Overwriting an existing dataset replaces it cleanly (no .tmp left behind).
     let w = 4, h = 4

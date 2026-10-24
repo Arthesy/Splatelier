@@ -48,6 +48,14 @@ jobs:
           restore-keys: spm-${{ runner.os }}-
       - name: Build the Swift package
         run: swift build
+      # The iOS app builds into its own DerivedData, so the .build cache above does not help it. Most
+      # of its time is compiling mlx-swift (C++ and Metal), which is the same every run, so keep
+      # DerivedData too. Without it that took about 5 minutes of the 6.5 the app build needed.
+      - uses: actions/cache@v4
+        with:
+          path: DerivedData
+          key: ios-${{ runner.os }}-${{ hashFiles('Package.swift') }}
+          restore-keys: ios-${{ runner.os }}-
       - name: Build the iOS app for the simulator
         run: |
           xcodebuild build -quiet \
@@ -56,4 +64,5 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath DerivedData \
             ARCHS=arm64 \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO

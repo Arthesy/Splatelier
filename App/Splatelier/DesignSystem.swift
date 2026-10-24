@@ -24,10 +24,27 @@ enum DesignSystem {
 extension View {
     /// Standard content card background (material + unified corner radius). The caller adds padding
     /// / frame.
+    /// The app's indigo behind a navigation screen (and behind a List's rows, which would
+    /// otherwise draw their own background).
+    func appBackground() -> some View {
+        scrollContentBackground(.hidden)
+            .containerBackground(Color.appBackground, for: .navigation)
+    }
+
     func cardBackground() -> some View {
         background(
             .thinMaterial,
             in: RoundedRectangle(cornerRadius: DesignSystem.cardRadius, style: .continuous)
         )
     }
+}
+
+extension Color {
+    /// The kikyo purple of the icon and the animations, for filled buttons (white text on it reads
+    /// at 4.6:1). Text and icons use the lighter AccentColor (#9A82F2), which reads on the dark UI.
+    static let kikyoFill = Color(red: 0x7C / 255, green: 0x5C / 255, blue: 0xE6 / 255)
+
+    /// The deep indigo of the launch screen and the animations, behind every screen except the
+    /// ones that show photos or the 3D scene (those stay black).
+    static let appBackground = Color(red: 0x16 / 255, green: 0x1B / 255, blue: 0x46 / 255)
 }

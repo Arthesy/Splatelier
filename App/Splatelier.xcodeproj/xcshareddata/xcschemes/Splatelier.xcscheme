@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Scheme
    LastUpgradeVersion = "1430"
-   version = "1.3">
+   version = "1.7">
    <BuildAction
       parallelizeBuildables = "YES"
-      buildImplicitDependencies = "YES">
+      buildImplicitDependencies = "YES"
+      runPostActionsOnFailure = "NO">
       <BuildActionEntries>
          <BuildActionEntry
             buildForTesting = "YES"
@@ -14,7 +15,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "42057EF47F8156BC6E38AFDE"
+               BlueprintIdentifier = "C4D752EDA89B41CA008D4A3C"
                BuildableName = "Splatelier.app"
                BlueprintName = "Splatelier"
                ReferencedContainer = "container:Splatelier.xcodeproj">
@@ -26,11 +27,12 @@
       buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
-      shouldUseLaunchSchemeArgsEnv = "YES">
+      shouldUseLaunchSchemeArgsEnv = "YES"
+      onlyGenerateCoverageForSpecifiedTargets = "NO">
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "42057EF47F8156BC6E38AFDE"
+            BlueprintIdentifier = "C4D752EDA89B41CA008D4A3C"
             BuildableName = "Splatelier.app"
             BlueprintName = "Splatelier"
             ReferencedContainer = "container:Splatelier.xcodeproj">
@@ -53,12 +55,14 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "42057EF47F8156BC6E38AFDE"
+            BlueprintIdentifier = "C4D752EDA89B41CA008D4A3C"
             BuildableName = "Splatelier.app"
             BlueprintName = "Splatelier"
             ReferencedContainer = "container:Splatelier.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
+      <CommandLineArguments>
+      </CommandLineArguments>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"
@@ -70,12 +74,14 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "42057EF47F8156BC6E38AFDE"
+            BlueprintIdentifier = "C4D752EDA89B41CA008D4A3C"
             BuildableName = "Splatelier.app"
             BlueprintName = "Splatelier"
             ReferencedContainer = "container:Splatelier.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
+      <CommandLineArguments>
+      </CommandLineArguments>
    </ProfileAction>
    <AnalyzeAction
       buildConfiguration = "Debug">

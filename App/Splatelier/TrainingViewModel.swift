@@ -135,6 +135,13 @@ enum TrainingSettingsStore {
     }
 }
 
+/// What the viewer opens after training (Hashable so a navigation destination can key on it).
+struct ViewerTarget: Identifiable, Hashable {
+    let plyURL: URL
+    let logURL: URL?
+    var id: URL { plyURL }
+}
+
 @MainActor
 final class TrainingViewModel: ObservableObject {
 
@@ -145,8 +152,8 @@ final class TrainingViewModel: ObservableObject {
         case failed(String)
     }
 
-    /// Mesh generation state (independent of the training phase; can be generated before or after
-    /// training).
+    /// Mesh generation state (independent of the training phase; runs automatically after
+    /// training and after continued training).
     enum MeshPhase {
         case idle
         case running
@@ -158,7 +165,6 @@ final class TrainingViewModel: ObservableObject {
     @Published private(set) var meshPhase: MeshPhase = .idle
     /// Log of the last mesh generation (shared with the training log).
     @Published private(set) var meshLogURL: URL?
-    @Published private(set) var logTail: [String] = []   // Last logTailLimit lines
     @Published var iterations: Int = 3000
     @Published private(set) var elapsedSec: Double = 0
     @Published private(set) var peakMemoryBytes: Int = 0
@@ -200,7 +206,6 @@ final class TrainingViewModel: ObservableObject {
     private let preserveDataset: Bool
     private let trainQueue = DispatchQueue(label: "io.github.shuta-ochiai.splatelier.train",
                                             qos: .userInitiated)
-    private let logTailLimit = 20
     /// Cap on the Gaussian count (peak), the only training setting on the screen; everything else
     /// is the app's configuration (`CaptureTraining.AppPreset`). The densification ceiling; the
     /// initialization uses 5/6 of it (`AppPreset.initialGaussianCap`).
@@ -222,9 +227,18 @@ final class TrainingViewModel: ObservableObject {
         return saved == 200_000 ? preset : saved
     }
     /// Display name (optional). From a validation dataset it inherits that name; finalized in the
-    /// naming popup on completion.
+    /// naming popup on completion (and with the viewer's rename button).
     @Published var captureName: String = ""
+    /// Naming popup, shown when the first training's mesh is done.
     @Published var showNamePrompt = false
+    /// The first training finished and has not asked for a name yet ("Train more" never asks).
+    private var needsNamePrompt = false
+    /// Set when training and its automatic mesh have finished and the naming popup (if any) is
+    /// closed (first run or "Train more"); the screen pushes the viewer for it. Cleared when the
+    /// viewer is dismissed.
+    @Published var viewerTarget: ViewerTarget?
+    /// The viewer to open once the naming popup is closed.
+    private var pendingViewer: ViewerTarget?
     /// PLY URL of the completed capture (where the name sidecar is written).
     private var completedPlyURL: URL?
     /// Output folder capture_<T>/ and <T>. Created at the training start; mesh generation writes
@@ -251,13 +265,14 @@ final class TrainingViewModel: ObservableObject {
     func start() {
         guard case .idle = phase, !isGeneratingMesh else { return }
         phase = .running(iter: 0, latestLoss: nil)
-        logTail = []
         elapsedSec = 0
         peakMemoryBytes = 0
         activeMemoryBytes = 0
         runningTotalIterations = iterations
         cumulativeIterations = iterations
         resumableSession = nil
+        beginProgress(includesPreprocessing: true)
+        previewImage = nil
 
         // GPU training stops if the app is suspended by screen lock, so disable auto-lock during
         // training. Always set it back to false on completion/failure.
@@ -340,7 +355,6 @@ final class TrainingViewModel: ObservableObject {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.appendLog(msg)
                 self.parseProgress(msg)
                 let snap = MLX.Memory.snapshot()
                 self.peakMemoryBytes = snap.peakMemory
@@ -350,6 +364,7 @@ final class TrainingViewModel: ObservableObject {
         }
 
         let thermalHandler = makeThermalHandler()
+        let previewHandler = makePreviewHandler()
         let geometryCache = geometryCache
 
         trainQueue.async { [weak self] in
@@ -395,6 +410,7 @@ final class TrainingViewModel: ObservableObject {
                     // inspection (the viewer's Seed / camera display).
                     seedInspectionPLY: seedURL,
                     onThermalThrottle: thermalHandler,
+                    onPreview: previewHandler,
                     log: logHandler
                 )
                 try? logHandle?.close()
@@ -448,7 +464,8 @@ final class TrainingViewModel: ObservableObject {
                         finalLoss: result.lossHistory.last
                     )
                     self.completedPlyURL = plyURL
-                    self.showNamePrompt = true
+                    self.needsNamePrompt = true
+                    self.generateMesh()
                 }
             } catch {
                 try? logHandle?.close()
@@ -459,6 +476,7 @@ final class TrainingViewModel: ObservableObject {
                     self.thermalPaused = false
                     self.thermalThrottled = false
                     self.phase = .failed("\(error)")
+                    self.endProgress(finished: false)
                 }
             }
         }
@@ -515,6 +533,7 @@ final class TrainingViewModel: ObservableObject {
         let additional = Self.continueIterationCount
         phase = .running(iter: 0, latestLoss: nil)
         runningTotalIterations = additional
+        beginProgress(includesPreprocessing: false)
         UIApplication.shared.isIdleTimerDisabled = true
         MLX.Memory.peakMemory = 0
         let startTime = Date()
@@ -528,12 +547,8 @@ final class TrainingViewModel: ObservableObject {
         let logHandle = logURL.flatMap { try? FileHandle(forWritingTo: $0) }
         logHandle?.seekToEndOfFile()
 
-        let logHandler: (String) -> Void = { [weak self] msg in
+        let logHandler: (String) -> Void = { msg in
             if let data = (msg + "\n").data(using: .utf8) { logHandle?.write(data) }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.appendLog(msg)
-            }
         }
         let progressHandler: (Int, Float) -> Void = { [weak self] localIter, loss in
             DispatchQueue.main.async {
@@ -543,6 +558,7 @@ final class TrainingViewModel: ObservableObject {
         }
 
         let thermalHandler = makeThermalHandler()
+        let previewHandler = makePreviewHandler()
         trainQueue.async { [weak self] in
             do {
                 let result = try TrainingDriver.continueTraining(
@@ -552,6 +568,7 @@ final class TrainingViewModel: ObservableObject {
                     thumbnailPNG: thumbURL,
                     onProgress: progressHandler,
                     onThermalThrottle: thermalHandler,
+                    onPreview: previewHandler,
                     log: logHandler
                 )
                 try? logHandle?.close()
@@ -583,6 +600,8 @@ final class TrainingViewModel: ObservableObject {
                         gaussianCount: result.gaussianCount,
                         finalLoss: result.lossHistory.last
                     )
+                    // The Gaussians changed, so rebuild the mesh (overwrites the same OBJ).
+                    self.generateMesh()
                 }
             } catch {
                 try? logHandle?.close()
@@ -591,6 +610,7 @@ final class TrainingViewModel: ObservableObject {
                     guard let self else { return }
                     self.stopMetricsTimer()
                     self.phase = .failed("\(error)")
+                    self.endProgress(finished: false)
                 }
             }
         }
@@ -613,7 +633,7 @@ final class TrainingViewModel: ObservableObject {
 
     /// Only after training: the mesh comes from the trained splats (their surface depth, flattened
     /// by the geometric regularization), or from training's MVS depth maps when the run had none.
-    var canGenerateMesh: Bool {
+    private var canGenerateMesh: Bool {
         if isGeneratingMesh { return false }
         if case .completed = phase { return true }
         return false
@@ -622,10 +642,13 @@ final class TrainingViewModel: ObservableObject {
     /// Build a vertex-colored mesh via depth → TSDF fusion → Marching Cubes and save it as
     /// capture_<T>_mesh.obj in the capture folder. The depth is the trained splats' surface when
     /// training used the geometric regularization (holes in MVS filled, walls flat), else training's
-    /// MVS depth. Runs on the same queue as training so they do not compete for the GPU.
-    func generateMesh() {
+    /// MVS depth. Runs on the same queue as training so they do not compete for the GPU. Called on
+    /// every training completion, so there is no button for it.
+    private func generateMesh() {
         guard canGenerateMesh else { return }
         meshPhase = .running
+        meshStartDate = Date()
+        refreshProgress()
         UIApplication.shared.isIdleTimerDisabled = true
         let startTime = Date()
         let (dir, timestamp) = ensureCaptureFolder(date: startTime)
@@ -635,14 +658,10 @@ final class TrainingViewModel: ObservableObject {
         let logURL = dir.appendingPathComponent("capture_\(timestamp)_mesh.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let logHandle = try? FileHandle(forWritingTo: logURL)
-        let logHandler: (String) -> Void = { [weak self] msg in
+        let logHandler: (String) -> Void = { msg in
             if let h = logHandle, let d = (msg + "\n").data(using: .utf8) {
                 h.write(d)
                 try? h.synchronize()
-            }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.appendLog(msg)
             }
         }
         meshLogURL = logURL
@@ -700,8 +719,27 @@ final class TrainingViewModel: ObservableObject {
                     UIApplication.shared.isIdleTimerDisabled = false
                 }
                 self.meshPhase = outcome
+                self.endProgress(finished: true)
+                // Training is only done once its mesh is: ask for a name (first run only), then open
+                // the viewer with all layers (a failed mesh still opens it, without the mesh).
+                if let plyURL = self.lastOutputPLY {
+                    self.pendingViewer = ViewerTarget(plyURL: plyURL, logURL: self.lastLogURL)
+                    if self.needsNamePrompt {
+                        self.needsNamePrompt = false
+                        self.showNamePrompt = true
+                    } else {
+                        self.openViewerIfReady()
+                    }
+                }
             }
         }
+    }
+
+    /// Opens the viewer once the naming popup is closed (also called directly when there is none).
+    func openViewerIfReady() {
+        guard !showNamePrompt, let target = pendingViewer else { return }
+        pendingViewer = nil
+        viewerTarget = target
     }
 
     /// The seed point cloud + camera marker PLY written by training (if any). Overlaid with GS and
@@ -730,18 +768,141 @@ final class TrainingViewModel: ObservableObject {
         return (dir, timestamp)
     }
 
-    // MARK: - log handling
+    // MARK: - Preview of the model while it trains
 
-    private func appendLog(_ msg: String) {
-        logTail.append(msg)
-        if logTail.count > logTailLimit {
-            logTail.removeFirst(logTail.count - logTailLimit)
+    /// What the model looks like now, from one fixed view; updated every few seconds while training.
+    /// Kept after training so it stays on screen through the mesh generation.
+    @Published private(set) var previewImage: UIImage?
+    /// Counts the pictures (changes with each new one, so the screen can animate the swap).
+    @Published private(set) var previewCount = 0
+
+    /// Handler for the pictures the training loop produces (on the training thread). The frames are
+    /// in sensor orientation, so the image is marked rotated for a portrait screen.
+    private func makePreviewHandler() -> (TrainingPreviewFrame) -> Void {
+        { [weak self] frame in
+            guard let provider = CGDataProvider(data: Data(frame.rgba) as CFData),
+                  let cg = CGImage(
+                    width: frame.width, height: frame.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                    bytesPerRow: frame.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                    provider: provider, decode: nil, shouldInterpolate: true,
+                    intent: .defaultIntent)
+            else { return }
+            let image = UIImage(cgImage: cg, scale: 1, orientation: .right)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.previewImage = image
+                self.previewCount += 1
+            }
         }
     }
+
+    // MARK: - Overall progress
+
+    /// One bar for everything after Start training: preparing the frames, training, and the mesh.
+    /// The first run is split 15% / 75% / 10% by what the logs of real device runs showed
+    /// (preprocessing 14-36 s, training about 0.1 s per iteration, mesh about 10 s); "Train more"
+    /// has no preprocessing, so it is 90% / 10%. Training is exact (iteration / total); the other
+    /// two follow the stages the log reports and creep toward the next one in between.
+    @Published private(set) var overallProgress: Double = 0
+    /// What is being done now ("Training", "Generating mesh", ...).
+    @Published private(set) var progressLabel = ""
+    /// Detail next to the bar ("iter 1200 / 3000" while training).
+    @Published private(set) var progressDetail = ""
+
+    private var includesPreprocessing = false
+    private var trainingStarted = false
+    /// How many preprocessing markers (see `preStages`) the log has reported.
+    private var preMarkersSeen = 0
+    private var preMarkerDate = Date()
+    private var meshStartDate: Date?
+    private var progressTimer: Timer?
+
+    /// Preprocessing stages, in the order the log reports them. `marker` is the start of the log line
+    /// that ends the stage, `fraction` how much of preprocessing is done then (from the device
+    /// timings: intake 18%, poses 47%, depth 33%), `label` the stage that follows, `seconds` its
+    /// usual length.
+    private static let preStages: [(marker: String, fraction: Double, label: String, seconds: Double)] = [
+        ("[timing] intake(", 0.18, "Estimating camera poses", 10),
+        ("[timing] BA+geomrefine", 0.65, "Building depth maps", 8),
+        ("[timing] MVS(total)", 0.97, "Preparing to train", 2),
+        ("[timing] === pre-training total", 1.0, "Training", 1),
+    ]
+
+    private func beginProgress(includesPreprocessing: Bool) {
+        self.includesPreprocessing = includesPreprocessing
+        trainingStarted = !includesPreprocessing
+        preMarkersSeen = 0
+        preMarkerDate = Date()
+        meshStartDate = nil
+        refreshProgress()
+        progressTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            MainActor.assumeIsolated { self.refreshProgress() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        progressTimer = timer
+    }
+
+    private func endProgress(finished: Bool) {
+        progressTimer?.invalidate()
+        progressTimer = nil
+        if finished {
+            overallProgress = 1
+            progressLabel = ""
+            progressDetail = ""
+        }
+    }
+
+    /// Notes the log lines that mark a preprocessing stage as done.
+    private func noteStage(_ msg: String) {
+        guard includesPreprocessing, !trainingStarted else { return }
+        for (i, stage) in Self.preStages.enumerated() where msg.hasPrefix(stage.marker) {
+            preMarkersSeen = Swift.max(preMarkersSeen, i + 1)
+            preMarkerDate = Date()
+            if i == Self.preStages.count - 1 { trainingStarted = true }
+        }
+        if msg.hasPrefix("iter ") { trainingStarted = true }
+        refreshProgress()
+    }
+
+    private func refreshProgress() {
+        let preEnd = includesPreprocessing ? 0.15 : 0.0
+        let trainEnd = 0.90
+        if let start = meshStartDate, case .running = meshPhase {
+            // Mesh: creeps toward the end over its usual ten seconds.
+            let dt = Date().timeIntervalSince(start)
+            overallProgress = trainEnd + (1 - trainEnd) * 0.95 * (1 - exp(-dt / 6))
+            progressLabel = "Generating mesh"
+            progressDetail = ""
+        } else if case .running(let iter, _) = phase {
+            if trainingStarted {
+                let total = Double(Swift.max(1, runningTotalIterations))
+                overallProgress = preEnd + (trainEnd - preEnd) * Swift.min(1, Double(iter) / total)
+                progressLabel = "Training"
+                progressDetail = "iter \(iter) / \(runningTotalIterations)"
+            } else {
+                // Preprocessing: from the last finished stage toward the next one.
+                let floor = preMarkersSeen == 0 ? 0 : Self.preStages[preMarkersSeen - 1].fraction
+                let ceil = preMarkersSeen < Self.preStages.count ? Self.preStages[preMarkersSeen].fraction : 1
+                let usual = preMarkersSeen == 0 ? 5 : Self.preStages[preMarkersSeen - 1].seconds
+                let dt = Date().timeIntervalSince(preMarkerDate)
+                let inStage = 0.9 * (1 - exp(-dt / Swift.max(1, usual)))
+                overallProgress = preEnd * (floor + (ceil - floor) * inStage)
+                progressLabel = preMarkersSeen == 0
+                    ? "Reading the frames" : Self.preStages[preMarkersSeen - 1].label
+                progressDetail = ""
+            }
+        }
+    }
+
+    // MARK: - log handling (the log itself is the file; only the progress is read from it)
 
     /// Pick up progress from the "iter <N>: loss <F> (<count> gaussians) (<name>)" lines emitted by
     /// the training loop.
     private func parseProgress(_ msg: String) {
+        noteStage(msg)
         guard msg.hasPrefix("iter "), case .running = phase else { return }
         let parts = msg.split(separator: " ")
         guard parts.count >= 4,

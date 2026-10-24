@@ -3,9 +3,10 @@
 //
 // Public entry point. SwiftUI screen that shows a trained PLY (any format SplatIO can read) with an
 // orbit camera. The seed point cloud, capture cameras and mesh (OBJ) can be overlaid in the same
-// scene and toggled, and the trained background can be hidden. The "Measure" button at the bottom
-// enters measure mode to measure the distance between 2 tapped points. Double tap (double click on
-// macOS) zooms in, making that point the center of rotation.
+// scene and toggled from the "Display" menu, where the trained background can be hidden and the mesh
+// switched to shaded. The "Measure" button at the bottom enters measure mode to measure the distance
+// between 2 tapped points. Double tap (double click on macOS) zooms in, making that point the center
+// of rotation.
 
 import SwiftUI
 
@@ -27,14 +28,25 @@ public struct SplatViewerScreen: View {
     private let url: URL?
     private let seedURL: URL?
     private let meshURL: URL?
+    private let shareItems: [SplatViewerShareItem]
+    /// Handler for the "Train more" button. nil hides the button (the screen has no training
+    /// session to continue).
+    private let onTrainMore: (() -> Void)?
+    /// What the confirmation before "Train more" tells the user.
+    private let trainMoreMessage: String
     /// Receiver of rename notifications. nil hides the editing UI (saving the sidecar is the app's
     /// job).
     private let onRename: ((String) -> Void)?
     /// Held in @State so edits show immediately.
     @State private var displayName: String
     @State private var showRename = false
+    @State private var showHint = false
+    @State private var showTrainMoreConfirm = false
     @State private var renameText = ""
     @StateObject private var model = SplatViewerModel()
+    #if os(iOS)
+    @StateObject private var sharer = SplatViewerSharePreparer()
+    #endif
 
 #if os(macOS)
     // Values at gesture start. drag / pinch are handled as absolute amounts from the start point
@@ -53,16 +65,25 @@ public struct SplatViewerScreen: View {
     ///   - meshURL: OBJ of a vertex-colored mesh. If given, overlaid in the same scene and
     ///     toggleable.
     ///   - name: Display name (file name if nil).
+    ///   - shareItems: Files offered by the Share button, one entry each. Empty hides the button.
+    ///   - onTrainMore: Called when the user confirms "Train more". nil hides the button.
+    ///   - trainMoreMessage: Shown in the confirmation (what will happen, how long it takes).
     public init(
         url: URL?,
         seedURL: URL? = nil,
         meshURL: URL? = nil,
         name: String? = nil,
+        shareItems: [SplatViewerShareItem] = [],
+        onTrainMore: (() -> Void)? = nil,
+        trainMoreMessage: String = "Training continues from this result.",
         onRename: ((String) -> Void)? = nil
     ) {
         self.url = url
         self.seedURL = seedURL
         self.meshURL = meshURL
+        self.shareItems = shareItems
+        self.onTrainMore = onTrainMore
+        self.trainMoreMessage = trainMoreMessage
         self.onRename = onRename
         _displayName = State(initialValue: name ?? Self.fileName(url ?? meshURL))
     }
@@ -89,23 +110,50 @@ public struct SplatViewerScreen: View {
                 .ignoresSafeArea()
 
             overlay
+            #if os(iOS)
+            preparingOverlay
+            #endif
         }
+        #if os(iOS)
+        .sheet(item: $sharer.ready) { file in SplatViewerShareSheet(url: file.url) }
+        .alert("Couldn't share", isPresented: Binding(
+            get: { sharer.errorMessage != nil }, set: { if !$0 { sharer.errorMessage = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(sharer.errorMessage ?? "")
+        }
+        #endif
         .navigationTitle(displayName)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.visible, for: .navigationBar)
         #endif
         .toolbar {
-            if onRename != nil {
-                ToolbarItem(placement: renameButtonPlacement) {
+            ToolbarItemGroup(placement: toolbarPlacement) {
+                hintButton
+                if !shareItems.isEmpty { shareMenu }
+                if onTrainMore != nil {
+                    // Training is long and replaces this result, so ask before starting it.
+                    Button { showTrainMoreConfirm = true } label: {
+                        Label("Train more", systemImage: "plus.circle")
+                    }
+                }
+                if onRename != nil {
                     Button {
                         renameText = displayName
                         showRename = true
                     } label: {
-                        Image(systemName: "pencil")
+                        Label("Rename", systemImage: "pencil")
                     }
                 }
             }
+        }
+        .alert("Train more?", isPresented: $showTrainMoreConfirm) {
+            Button("Train more") { onTrainMore?() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(trainMoreMessage)
         }
         .alert("Rename", isPresented: $showRename) {
             TextField("Name", text: $renameText)
@@ -118,13 +166,117 @@ public struct SplatViewerScreen: View {
         }
     }
 
-    private var renameButtonPlacement: ToolbarItemPlacement {
+    private var toolbarPlacement: ToolbarItemPlacement {
         #if os(iOS)
         .topBarTrailing
         #else
         .automatic
         #endif
     }
+
+    /// One entry per thing to share (GS, mesh, logs). An entry with several options (the GS in
+    /// different formats) is a submenu. Options that are made when picked show a progress overlay
+    /// and then the share sheet.
+    private var shareMenu: some View {
+        Menu {
+            ForEach(shareItems) { item in
+                if item.options.count == 1, let option = item.options.first {
+                    optionControl(option, label: Label(item.title, systemImage: item.systemImage))
+                } else {
+                    Menu {
+                        ForEach(item.options) { option in
+                            optionControl(option, label: Text(option.title))
+                        }
+                    } label: {
+                        Label(item.title, systemImage: item.systemImage)
+                    }
+                }
+            }
+        } label: {
+            Label("Share", systemImage: "square.and.arrow.up")
+        }
+    }
+
+    @ViewBuilder
+    private func optionControl<Content: View>(
+        _ option: SplatViewerShareItem.Option, label: Content
+    ) -> some View {
+        switch option.source {
+        case .file(let url):
+            ShareLink(item: url) { label }
+        case .files(let urls):
+            ShareLink(items: urls) { label }
+        case .prepared(let prepare):
+            #if os(iOS)
+            Button { sharer.prepare(title: option.title, prepare) } label: { label }
+            #endif
+        }
+    }
+
+    /// Opens a popover that lists the camera controls.
+    private var hintButton: some View {
+        Button {
+            showHint = true
+        } label: {
+            Label("Hint", systemImage: "questionmark.circle")
+        }
+        .popover(isPresented: $showHint) {
+            hintContent
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    private var hintContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            #if os(iOS)
+            hintRow("hand.point.up.left", "Rotate", "Drag with 1 finger")
+            hintRow("hand.draw", "Pan", "Drag with 2 fingers")
+            hintRow("arrow.up.left.and.arrow.down.right", "Zoom", "Pinch")
+            hintRow("scope", "Focus", "Double-tap a point to zoom in and orbit around it")
+            hintRow("ruler", "Measure", "Turn on Measure, then tap 2 points")
+            #else
+            hintRow("cursorarrow.motionlines", "Rotate", "Drag")
+            hintRow("arrow.up.left.and.arrow.down.right", "Zoom", "Pinch or scroll")
+            hintRow("scope", "Focus", "Double-click a point to zoom in and orbit around it")
+            hintRow("ruler", "Measure", "Turn on Measure, then click 2 points")
+            #endif
+        }
+        .padding(16)
+        .frame(minWidth: 260)
+    }
+
+    private func hintRow(_ symbol: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol)
+                .frame(width: 22)
+                .foregroundStyle(Color.accentColor)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    #if os(iOS)
+    /// Shown while a share option is being prepared (a format conversion can take a while).
+    @ViewBuilder
+    private var preparingOverlay: some View {
+        if let title = sharer.preparing {
+            ZStack {
+                Color.black.opacity(0.45).ignoresSafeArea()
+                VStack(spacing: 14) {
+                    ProgressView()
+                    Text("Preparing \(title)…").font(.subheadline)
+                    Button("Cancel") { sharer.cancel() }
+                        .buttonStyle(.bordered)
+                }
+                .padding(24)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+            }
+            .transition(.opacity)
+        }
+    }
+    #endif
 
     // MARK: Overlay
 
@@ -140,31 +292,12 @@ public struct SplatViewerScreen: View {
         case .failed(let msg):
             status(symbol: "exclamationmark.triangle", title: "Couldn't load", detail: msg)
         case .loaded(let count):
-            // Top to bottom: layer toggles → controls help (measurement hint while measuring) →
-            // splat / triangle counts, Measure, Reset.
+            // Top to bottom: measurement hint (while measuring) → Display / Measure / Reset →
+            // splat / triangle counts.
             VStack {
                 Spacer()
-                if model.hasGS || model.hasSeed || model.hasCameraMarkers || model.hasMesh {
-                    // Scrolls sideways only when the toggles don't fit (iPhone with a mesh, etc.).
-                    ViewThatFits(in: .horizontal) {
-                        layerToggles
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            layerToggles.padding(.horizontal, 12)
-                        }
-                    }
-                    .padding(.bottom, 4)
-                }
                 if model.isMeasuring {
                     measureControls
-                } else {
-                    #if os(iOS)
-                    Text("1 finger: rotate · 2 fingers: pan · Pinch: zoom · Double-tap: focus")
-                        .font(.caption2).foregroundStyle(.secondary)
-                        .lineLimit(1).minimumScaleFactor(0.8)
-                        .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.bottom, 4)
-                    #endif
                 }
                 bottomBar(splats: count)
                     .padding(.horizontal, 12).padding(.vertical)
@@ -172,60 +305,72 @@ public struct SplatViewerScreen: View {
         }
     }
 
-    /// Layer visibility toggles. Background and Shading appear only while their parent layer (GS,
-    /// Mesh) is shown.
-    private var layerToggles: some View {
-        HStack(spacing: 8) {
+    /// Display options (layer visibility, mesh appearance) in one menu, so the bottom edge doesn't
+    /// fill up with a row of toggles. Background and Shading sit in their parent layer's section and are disabled (not hidden)
+    /// while that layer is off, so rows don't jump. The menu stays open after each pick, letting
+    /// several layers be switched in one go.
+    private var displayMenu: some View {
+        Menu {
             if model.hasGS {
-                toggleCapsule("GS", systemImage: "cube.fill", isOn: model.showGS) {
-                    model.showGS.toggle()
-                }
-                if model.hasBackground && model.showGS {
-                    toggleCapsule("Background", systemImage: "globe", isOn: model.showBackground) {
-                        model.showBackground.toggle()
+                Section("Gaussian splats") {
+                    Toggle(isOn: $model.showGS) { Label("Splats", systemImage: "cube.fill") }
+                    if model.hasBackground {
+                        Toggle(isOn: $model.showBackground) { Label("Background", systemImage: "globe") }
+                            .disabled(!model.showGS)
                     }
                 }
             }
             if model.hasMesh {
-                toggleCapsule("Mesh", systemImage: "triangle", isOn: model.showMesh) {
-                    model.showMesh.toggle()
+                Section("Mesh") {
+                    Toggle(isOn: $model.showMesh) { Label("Mesh", systemImage: "triangle") }
+                    Picker(selection: $model.meshShaded) {
+                        Label("Vertex colors", systemImage: "paintpalette").tag(false)
+                        Label("Shaded", systemImage: "light.max").tag(true)
+                    } label: {
+                        Text("Appearance")
+                    }
+                    .pickerStyle(.inline)
+                    .disabled(!model.showMesh)
                 }
-                if model.showMesh {
-                    toggleCapsule("Shading", systemImage: "light.max", isOn: model.meshShaded) {
-                        model.meshShaded.toggle()
+            }
+            if model.hasSeed || model.hasCameraMarkers {
+                Section("Capture") {
+                    if model.hasSeed {
+                        Toggle(isOn: $model.showSeed) { Label("Seed points", systemImage: "circle.grid.3x3.fill") }
+                    }
+                    if model.hasCameraMarkers {
+                        Toggle(isOn: $model.showCameraMarkers) { Label("Cameras", systemImage: "camera.fill") }
                     }
                 }
             }
-            if model.hasSeed {
-                toggleCapsule("Seed", systemImage: "circle.grid.3x3.fill", isOn: model.showSeed) {
-                    model.showSeed.toggle()
-                }
-            }
-            if model.hasCameraMarkers {
-                toggleCapsule("Cameras", systemImage: "camera.fill", isOn: model.showCameraMarkers) {
-                    model.showCameraMarkers.toggle()
-                }
-            }
+        } label: {
+            Label("Display", systemImage: "eye")
+                .font(.caption)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
         }
+        #if os(iOS)
+        // Stay open after each pick, so several layers can be switched at once.
+        .menuActionDismissBehavior(.disabled)
+        // Opening upward from the bottom bar, iOS would otherwise flip the sections bottom-up.
+        .menuOrder(.fixed)
+        #endif
+        #if os(macOS)
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        #endif
+        .buttonStyle(.plain)
     }
 
-    /// Bottom edge: splat and triangle counts on the left, Measure and Reset on the right, in one
-    /// row. At widths too narrow even for that (iPhone SE etc.) only the counts move to the row
-    /// above. Counts never wrap into a vertical stack; they stay side by side.
+    /// Bottom edge, two rows: Display, Measure and Reset centered, with the splat and triangle
+    /// counts right-aligned below them. Counts never wrap into a vertical stack; they stay side by
+    /// side.
     private func bottomBar(splats: Int) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 6) {
-                counts(splats: splats)
-                Spacer(minLength: 0)
-                trailingControls
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                counts(splats: splats)
-                HStack {
-                    Spacer()
-                    trailingControls
-                }
-            }
+        VStack(spacing: 8) {
+            trailingControls
+                .frame(maxWidth: .infinity)
+            counts(splats: splats)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 
@@ -250,9 +395,12 @@ public struct SplatViewerScreen: View {
             .background(.ultraThinMaterial, in: Capsule())
     }
 
-    /// Measure-mode toggle and Reset.
+    /// Display menu, measure-mode toggle and Reset.
     private var trailingControls: some View {
         HStack(spacing: 6) {
+            if model.hasGS || model.hasSeed || model.hasCameraMarkers || model.hasMesh {
+                displayMenu
+            }
             toggleCapsule("Measure", systemImage: "ruler", isOn: model.isMeasuring) {
                 model.isMeasuring.toggle()
             }
@@ -311,7 +459,10 @@ public struct SplatViewerScreen: View {
             : "\(action) to place the end point"
     }
 
-    /// On / off capsule button (filled = on). Used for layer visibility and measure mode.
+    /// Fill of a button that is on: the kikyo purple, with white text on it.
+    private static let onFill = Color(red: 0x7C / 255, green: 0x5C / 255, blue: 0xE6 / 255)
+
+    /// On / off capsule button (filled = on). Used for measure mode.
     private func toggleCapsule(
         _ title: String, systemImage: String, isOn: Bool, action: @escaping () -> Void
     ) -> some View {
@@ -321,7 +472,7 @@ public struct SplatViewerScreen: View {
                 .foregroundStyle(isOn ? Color.white : Color.secondary)
                 .padding(.horizontal, 10).padding(.vertical, 6)
                 .background(
-                    isOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.ultraThinMaterial),
+                    isOn ? AnyShapeStyle(Self.onFill) : AnyShapeStyle(.ultraThinMaterial),
                     in: Capsule()
                 )
         }
@@ -533,6 +684,9 @@ public struct SplatViewerScreen: View {
         seedURL: URL? = nil,
         meshURL: URL? = nil,
         name: String? = nil,
+        shareItems: [SplatViewerShareItem] = [],
+        onTrainMore: (() -> Void)? = nil,
+        trainMoreMessage: String = "",
         onRename: ((String) -> Void)? = nil
     ) {}
     public var body: some View {

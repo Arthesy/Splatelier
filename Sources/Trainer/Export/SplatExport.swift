@@ -18,6 +18,8 @@ public enum SplatExportFormat: String, CaseIterable, Sendable, Identifiable {
     case glb
     /// PlayCanvas SOG: WebP textures plus meta.json, bundled in a zip.
     case sog
+    /// OpenUSD ASCII with a ParticleField3DGaussianSplat prim (OpenUSD v26.03).
+    case usda
 
     public var id: String { rawValue }
 
@@ -30,6 +32,7 @@ public enum SplatExportFormat: String, CaseIterable, Sendable, Identifiable {
         case .splat: return "splat"
         case .glb: return "glb"
         case .sog: return "sog"
+        case .usda: return "usda"
         }
     }
 
@@ -41,6 +44,7 @@ public enum SplatExportFormat: String, CaseIterable, Sendable, Identifiable {
         case .splat: return ".splat"
         case .glb: return "glTF (GLB)"
         case .sog: return "SOG"
+        case .usda: return "OpenUSD"
         }
     }
 
@@ -48,7 +52,7 @@ public enum SplatExportFormat: String, CaseIterable, Sendable, Identifiable {
     public var viewerReadable: Bool {
         switch self {
         case .ply, .spz, .splat: return true
-        case .compressedPly, .glb, .sog: return false
+        case .compressedPly, .glb, .sog, .usda: return false
         }
     }
 
@@ -91,6 +95,7 @@ public enum SplatExporter {
         case .splat: try DotSplatWriter.write(table, to: url)
         case .glb: try GLBWriter.write(table, to: url)
         case .sog: try SOGWriter.write(table, to: url, options: options)
+        case .usda: try USDWriter.write(table, to: url)
         }
         if format.viewerReadable {
             try PLYWriter.writeBackgroundSidecar(splatCount: table.backgroundCount, siblingOf: url)

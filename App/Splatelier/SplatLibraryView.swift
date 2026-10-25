@@ -192,6 +192,7 @@ struct SplatLibraryView: View {
                         meshURL: item.meshURL,
                         name: item.name,
                         shareItems: shareItems(for: item),
+                        cropExport: SplatExportShare.cropExport,
                         onRename: { newName in
                             CaptureMetadataName.save(newName, for: item.mainURL)
                             reload()

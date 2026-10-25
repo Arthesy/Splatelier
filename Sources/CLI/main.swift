@@ -79,7 +79,7 @@ func usage() {
     print("    Drag to orbit, scroll to zoom; close the window to quit.")
     print("    env: VIEWER_TRANSPARENCY=sorted|stochastic|movement (default movement = stochastic alpha only while interacting)")
     print("")
-    print("  splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog}> [shDegree]")
+    print("  splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog,usda}> [shDegree]")
     print("    Convert a trained PLY to another splat format, picked by the output extension.")
     print("    Keeps every SH band the PLY has unless [shDegree] (0-3) lowers it. SOG and GLB need")
     print("    no viewer support here; the <base>.background.json sidecar is read and, for")
@@ -768,7 +768,7 @@ case "stats":
 
 case "convert":
     guard args.count >= 4 else {
-        print("usage: splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog}> [shDegree]")
+        print("usage: splatelier convert <in.ply> <out.{ply,compressed.ply,spz,splat,glb,sog,usda}> [shDegree]")
         exit(1)
     }
     let inURL = URL(fileURLWithPath: args[2])

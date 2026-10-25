@@ -42,8 +42,11 @@ public struct SplatViewerScreen: View {
     @State private var showRename = false
     @State private var showHint = false
     @State private var showTrainMoreConfirm = false
+    @State private var showEditOptions = false
+    @State private var showColorHelp = false
+    @State private var showCropHelp = false
     @State private var renameText = ""
-    @StateObject private var model = SplatViewerModel()
+    @StateObject private var model: SplatViewerModel
     #if os(iOS)
     @StateObject private var sharer = SplatViewerSharePreparer()
     #endif
@@ -53,6 +56,9 @@ public struct SplatViewerScreen: View {
     // (macOS only).
     @State private var dragBase: SIMD2<Float>?
     @State private var zoomBase: Float?
+    /// The drag in progress moves a crop handle, and the translation applied so far.
+    @State private var cropDragging = false
+    @State private var lastDragTranslation = CGSize.zero
     /// Size of the MTKView, for normalizing click positions.
     @State private var metalViewSize: CGSize = .zero
 #endif
@@ -74,10 +80,12 @@ public struct SplatViewerScreen: View {
         meshURL: URL? = nil,
         name: String? = nil,
         shareItems: [SplatViewerShareItem] = [],
+        cropExport: SplatViewerCropExport? = nil,
         onTrainMore: (() -> Void)? = nil,
         trainMoreMessage: String = "Training continues from this result.",
         onRename: ((String) -> Void)? = nil
     ) {
+        _model = StateObject(wrappedValue: SplatViewerModel(cropExport: cropExport))
         self.url = url
         self.seedURL = seedURL
         self.meshURL = meshURL
@@ -108,6 +116,8 @@ public struct SplatViewerScreen: View {
 
             SplatMeasureOverlay(projection: model.measureProjection)
                 .ignoresSafeArea()
+            SplatCropOverlay(projection: model.cropProjection)
+                .ignoresSafeArea()
 
             overlay
             #if os(iOS)
@@ -132,7 +142,7 @@ public struct SplatViewerScreen: View {
         .toolbar {
             ToolbarItemGroup(placement: toolbarPlacement) {
                 hintButton
-                if !shareItems.isEmpty { shareMenu }
+                if !allShareItems.isEmpty { shareMenu }
                 if onTrainMore != nil {
                     // Training is long and replaces this result, so ask before starting it.
                     Button { showTrainMoreConfirm = true } label: {
@@ -177,9 +187,14 @@ public struct SplatViewerScreen: View {
     /// One entry per thing to share (GS, mesh, logs). An entry with several options (the GS in
     /// different formats) is a submenu. Options that are made when picked show a progress overlay
     /// and then the share sheet.
+    /// The cropped PLY comes first while a crop is applied, then the files the app passed in.
+    private var allShareItems: [SplatViewerShareItem] {
+        (model.cropShareItem.map { [$0] } ?? []) + shareItems
+    }
+
     private var shareMenu: some View {
         Menu {
-            ForEach(shareItems) { item in
+            ForEach(allShareItems) { item in
                 if item.options.count == 1, let option = item.options.first {
                     optionControl(option, label: Label(item.title, systemImage: item.systemImage))
                 } else {
@@ -234,11 +249,13 @@ public struct SplatViewerScreen: View {
             hintRow("arrow.up.left.and.arrow.down.right", "Zoom", "Pinch")
             hintRow("scope", "Focus", "Double-tap a point to zoom in and orbit around it")
             hintRow("ruler", "Measure", "Turn on Measure, then tap 2 points")
+            hintRow("crop", "Crop", "Edit, then Crop, then drag a handle of the box or sphere")
             #else
             hintRow("cursorarrow.motionlines", "Rotate", "Drag")
             hintRow("arrow.up.left.and.arrow.down.right", "Zoom", "Pinch or scroll")
             hintRow("scope", "Focus", "Double-click a point to zoom in and orbit around it")
             hintRow("ruler", "Measure", "Turn on Measure, then click 2 points")
+            hintRow("crop", "Crop", "Edit, then Crop, then drag a handle of the box or sphere")
             #endif
         }
         .padding(16)
@@ -291,15 +308,24 @@ public struct SplatViewerScreen: View {
             status(symbol: "cube.transparent", title: "No splats", detail: "This file has no Gaussians to show")
         case .failed(let msg):
             status(symbol: "exclamationmark.triangle", title: "Couldn't load", detail: msg)
-        case .loaded(let count):
-            // Top to bottom: measurement hint (while measuring) → Display / Measure / Reset →
-            // splat / triangle counts.
+        case .loaded:
+            // Top to bottom: measurement hint (while measuring) → Display / Measure / Reset.
             VStack {
                 Spacer()
                 if model.isMeasuring {
                     measureControls
                 }
-                bottomBar(splats: count)
+                if model.hasGS && showEditOptions {
+                    editOptions
+                }
+                if model.isCropping {
+                    cropControls
+                }
+                if model.isColoring {
+                    SplatViewerColorPanel(model: model) { model.isColoring = false }
+                        .padding(.bottom, 4)
+                }
+                bottomBar
                     .padding(.horizontal, 12).padding(.vertical)
             }
         }
@@ -362,40 +388,14 @@ public struct SplatViewerScreen: View {
         .buttonStyle(.plain)
     }
 
-    /// Bottom edge, two rows: Display, Measure and Reset centered, with the splat and triangle
-    /// counts right-aligned below them. Counts never wrap into a vertical stack; they stay side by
-    /// side.
-    private func bottomBar(splats: Int) -> some View {
-        VStack(spacing: 8) {
-            trailingControls
-                .frame(maxWidth: .infinity)
-            counts(splats: splats)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-        }
+    /// Bottom edge: Display, Edit, Measure and Reset, centered. The splat and triangle counts are
+    /// no longer shown here.
+    private var bottomBar: some View {
+        trailingControls
+            .frame(maxWidth: .infinity)
     }
 
-    /// Puts the splat-count and triangle-count capsules side by side. Only the splat count without
-    /// a mesh, only the triangle count without splats.
-    private func counts(splats: Int) -> some View {
-        HStack(spacing: 6) {
-            if splats > 0 || !model.hasMesh {
-                countCapsule("\(splats) splats")
-            }
-            if model.hasMesh {
-                countCapsule("\(model.meshTriangleCount) triangles")
-            }
-        }
-    }
-
-    private func countCapsule(_ text: String) -> some View {
-        Text(text)
-            .font(.caption.monospacedDigit())
-            .lineLimit(1)
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
-    }
-
-    /// Display menu, measure-mode toggle and Reset.
+    /// Display and Edit menus, measure-mode toggle and Reset.
     private var trailingControls: some View {
         HStack(spacing: 6) {
             if model.hasGS || model.hasSeed || model.hasCameraMarkers || model.hasMesh {
@@ -404,8 +404,12 @@ public struct SplatViewerScreen: View {
             toggleCapsule("Measure", systemImage: "ruler", isOn: model.isMeasuring) {
                 model.isMeasuring.toggle()
             }
+            if model.hasGS {
+                editButton
+            }
             Button {
                 model.resetCamera()
+                resetEdits()
             } label: {
                 Label("Reset", systemImage: "arrow.counterclockwise")
                     .font(.caption)
@@ -413,6 +417,73 @@ public struct SplatViewerScreen: View {
                     .background(.ultraThinMaterial, in: Capsule())
             }
             .buttonStyle(.plain)
+        }
+    }
+
+    /// Edits to the foreground splats. Edit reveals a row with Color and Crop just above the bottom
+    /// bar. A plain button rather than a Menu: the menu's list opened offset from the button.
+    private var editButton: some View {
+        toggleCapsule("Edit", systemImage: "slider.horizontal.3", isOn: showEditOptions) {
+            showEditOptions.toggle()
+            // Closing Edit closes what it opened, so no panel is left behind without its row.
+            if !showEditOptions {
+                model.isCropping = false
+                model.isColoring = false
+            }
+        }
+    }
+
+    /// Color and Crop, shown once Edit is on. Color opens its panel; Crop turns on the handles.
+    /// Each has a ? beside it that explains what it does, so the explanations stay out of the way.
+    private var editOptions: some View {
+        HStack(spacing: 6) {
+            HStack(spacing: 2) {
+                toggleCapsule("Color", systemImage: "paintpalette", isOn: model.isColoring) {
+                    model.isColoring.toggle()
+                }
+                helpButton(isPresented: $showColorHelp,
+                           text: "Change the tint, temperature, saturation, brightness, levels and opacity. The splats update as you move a slider. Reset returns to the original colours.")
+            }
+            HStack(spacing: 2) {
+                toggleCapsule("Crop", systemImage: "crop", isOn: model.isCropping) {
+                    model.isCropping.toggle()
+                }
+                helpButton(isPresented: $showCropHelp,
+                           text: "Drag a handle to resize the box or sphere. Drag anywhere else to rotate the view. Keep inside or remove inside decides which splats are kept.")
+            }
+        }
+    }
+
+    /// A ? that shows a short explanation in a popover.
+    private func helpButton(isPresented: Binding<Bool>, text: LocalizedStringKey) -> some View {
+        Button {
+            isPresented.wrappedValue = true
+        } label: {
+            Image(systemName: "questionmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(6)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: isPresented) {
+            // Size the text to its full height. A popover on iPhone otherwise clips it to one line.
+            Text(text)
+                .font(.callout)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 260, alignment: .leading)
+                .padding()
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    /// Reset also undoes the edits: the colour grade goes back to none, and a crop is restored to
+    /// every splat as loaded. Edits are not undone one step at a time; that is what Undo is for.
+    private func resetEdits() {
+        model.applyColorGrade(.identity)
+        if model.cropEdited {
+            model.onCropRestore?()
         }
     }
 
@@ -459,8 +530,73 @@ public struct SplatViewerScreen: View {
             : "\(action) to place the end point"
     }
 
+    /// Crop-mode controls: the hint, the shape and keep/remove pickers, and Apply with Undo and
+    /// Restore (the last only once something is cropped).
+    /// The crop panel. It has the same card and foot row as the Color panel: a title, the two
+    /// settings, then Undo and Restore on the left and Apply on the right. Undo and Restore stay in
+    /// place and are disabled when there is nothing to undo or restore, so the layout doesn't jump.
+    private var cropControls: some View {
+        VStack(spacing: 10) {
+            Text("Crop")
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Picker("Shape", selection: Binding(
+                get: { model.cropShape }, set: { model.setCropShape($0) })
+            ) {
+                ForEach(SplatViewerCropShape.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Picker("Mode", selection: $model.cropKeepsInside) {
+                Text("Keep inside").tag(true)
+                Text("Remove inside").tag(false)
+            }
+            .pickerStyle(.segmented)
+            if let notice = model.cropNotice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(Color.yellow)
+            }
+            HStack(spacing: 6) {
+                Button {
+                    model.onCropUndo?()
+                } label: {
+                    Label("Undo", systemImage: "arrow.uturn.backward")
+                }
+                .buttonStyle(SplatViewerPanelButtonStyle())
+                .disabled(!model.cropCanUndo)
+                Button {
+                    model.onCropRestore?()
+                } label: {
+                    Label("Restore", systemImage: "arrow.counterclockwise")
+                }
+                .buttonStyle(SplatViewerPanelButtonStyle())
+                .disabled(!model.cropEdited)
+                Spacer(minLength: 0)
+                // Apply cuts the region and stays in Crop, so more cuts can follow. Finish leaves Crop.
+                Button {
+                    model.onCropApply?()
+                } label: {
+                    Label("Apply", systemImage: "checkmark")
+                }
+                .buttonStyle(SplatViewerPanelButtonStyle())
+                Button {
+                    model.isCropping = false
+                    showEditOptions = false
+                } label: {
+                    Label("Finish", systemImage: "flag.checkered")
+                }
+                .buttonStyle(SplatViewerPanelButtonStyle(prominent: true))
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: 360)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
+    }
+
     /// Fill of a button that is on: the kikyo purple, with white text on it.
-    private static let onFill = Color(red: 0x7C / 255, green: 0x5C / 255, blue: 0xE6 / 255)
+    private static let onFill = SplatViewerPanelButtonStyle.fill
 
     /// On / off capsule button (filled = on). Used for measure mode.
     private func toggleCapsule(
@@ -497,12 +633,34 @@ public struct SplatViewerScreen: View {
     private var orbitGesture: some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
+                if dragBase == nil {
+                    // A drag that starts on a crop handle resizes the region instead of orbiting.
+                    dragBase = SIMD2(model.azimuth, model.elevation)
+                    lastDragTranslation = .zero
+                    cropDragging = model.isCropping
+                        && (normalized(value.startLocation).map { model.onCropHandleBegin?($0) ?? false } ?? false)
+                }
+                if cropDragging {
+                    let size = metalViewSize
+                    if size.width > 0, size.height > 0 {
+                        let dx = Float(value.translation.width - lastDragTranslation.width)
+                        let dy = Float(value.translation.height - lastDragTranslation.height)
+                        model.onCropHandleDrag?(SIMD2(dx / Float(size.width), dy / Float(size.height)))
+                    }
+                    lastDragTranslation = value.translation
+                    return
+                }
                 let base = dragBase ?? SIMD2(model.azimuth, model.elevation)
-                if dragBase == nil { dragBase = base }
                 model.azimuth = base.x + Float(value.translation.width) * 0.01
                 model.elevation = min(1.5, max(-1.5, base.y + Float(value.translation.height) * 0.01))
             }
-            .onEnded { _ in dragBase = nil }
+            .onEnded { _ in
+                dragBase = nil
+                if cropDragging {
+                    cropDragging = false
+                    model.onCropHandleEnd?()
+                }
+            }
     }
 
     private var zoomGesture: some Gesture {
@@ -595,9 +753,30 @@ private struct SplatMetalView: SplatViewRepresentable {
             }
         }
 
+        /// The drag in progress moves a crop handle (it started on one).
+        private var draggingCropHandle = false
+
+        /// A 1-finger drag that starts on a crop handle moves it; any other one orbits.
         @objc private func handleOrbit(_ g: UIPanGestureRecognizer) {
-            let t = g.translation(in: g.view)
-            g.setTranslation(.zero, in: g.view)
+            guard let view = g.view, view.bounds.width > 0, view.bounds.height > 0 else { return }
+            let t = g.translation(in: view)
+            g.setTranslation(.zero, in: view)
+            if g.state == .began {
+                // Until now the translation counted from where the touch began, so that is the start.
+                let p = g.location(in: view)
+                let start = CGPoint(x: p.x - t.x, y: p.y - t.y)
+                draggingCropHandle = renderer?.beginCropDrag(normalized: SIMD2(
+                    Float(start.x / view.bounds.width), Float(start.y / view.bounds.height))) ?? false
+            }
+            if draggingCropHandle {
+                renderer?.cropDrag(normalizedDelta: SIMD2(
+                    Float(t.x / view.bounds.width), Float(t.y / view.bounds.height)))
+                if g.state == .ended || g.state == .cancelled {
+                    draggingCropHandle = false
+                    renderer?.endCropDrag()
+                }
+                return
+            }
             renderer?.orbit(dxPixels: Float(t.x), dyPixels: Float(t.y))
         }
 

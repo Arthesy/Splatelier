@@ -10,7 +10,7 @@ import Trainer
 
 enum SplatExportShare {
     /// Formats offered besides the PLY itself, in menu order.
-    private static let convertedFormats: [SplatExportFormat] = [.compressedPly, .spz, .splat, .glb, .sog]
+    private static let convertedFormats: [SplatExportFormat] = [.compressedPly, .spz, .splat, .glb, .sog, .usda]
 
     /// The Share entry for the capture's GS file. Only a PLY can be converted (it is read back in
     /// full); anything else, such as an imported .spz, is shared as it is.
@@ -66,6 +66,16 @@ enum SplatExportShare {
             return out
         }.value
     }
+
+    /// The cropped splats' Share options: the PLY (see the viewer) and the same formats as above.
+    static let cropExport = SplatViewerCropExport(
+        formats: convertedFormats.map { SplatViewerCropExport.Format(title: $0.displayName, fileExtension: $0.fileExtension) },
+        convert: { plyURL, fileExtension in
+            guard let format = convertedFormats.first(where: { $0.fileExtension == fileExtension }) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            return try await export(plyURL, as: format)
+        })
 
     /// For the viewer's Share menu: a conversion made when the option is picked.
     private static func export(_ plyURL: URL, as format: SplatExportFormat) async throws -> URL {
